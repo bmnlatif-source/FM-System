@@ -1,12 +1,13 @@
-# Felix Maritime — ERP
+# Felix iQ — Felix Maritime ERP
 
-Internal ERP for Felix Maritime: yacht/owner/company registry, vessel-call
-operations, Suez Canal transit & port disbursement (PDA/FDA), crew & visa
-handling, and finance.
+Internal CRM/ERP for **Felix Maritime** (Port Said HQ + Ismailia office, est. 1983):
+yacht/owner/company/person registries, vessel-call operations, Suez Canal transit
+& port disbursement (PDA/FDA), crew change & visa handling, supply chain, and
+finance — three agencies (FMA / GRA / CRA) under one system.
 
-This repository turns the original single-file prototype into a deployable web
-app with a real backend (PostgreSQL via **Supabase**) so the whole company can
-use it at the same time, with real logins and shared, durable data.
+Full functional blueprint: [`docs/SYSTEM_SPEC.md`](docs/SYSTEM_SPEC.md).
+The living code (`src/App.jsx` + `src/lib/` + `supabase/`) is the authoritative
+reference; the spec is the faithful functional blueprint.
 
 ---
 
@@ -14,90 +15,99 @@ use it at the same time, with real logins and shared, durable data.
 
 | Layer | Status |
 |-------|--------|
-| Frontend app (`src/App.jsx`) | ✅ Working — currently runs on in-memory seed data |
+| Frontend app (`src/App.jsx`) | ✅ Working — 16 modules, Supabase-wired |
 | Build/deploy setup (Vite) | ✅ Done — `npm run dev` / `npm run build` |
-| Database schema (`supabase/schema.sql`) | ✅ Designed (v1) |
-| Access policies (`supabase/policies.sql`) | ✅ Designed (v1) |
-| Frontend ⇄ database wiring | ⏳ Phase 3 (next) |
-| Auth (real staff logins) | ⏳ Phase 2 |
-| Hosting / domain | ⏳ Phase 5 |
+| Database schema (`supabase/schema.sql`) | ✅ Done (v1, 20 tables) |
+| Access policies (`supabase/policies.sql`) | ✅ Done (RLS, staff-gated) |
+| Frontend ⇄ database wiring (`src/lib/db.js`) | ✅ Done — yachts / persons / companies / operations persist & sync |
+| Auth (real staff logins) | ✅ Done — `scripts/setup-supabase.mjs` bootstraps 6 accounts |
+| Transit / Crew / Visa / Logistics persistence | ⏳ Planned (currently seed data in local state) |
+| Hosting / domain (`erp.felix-eg.com`) | ⏳ Planned |
 
-See `docs/ARCHITECTURE.md` for the full plan.
+Without a `.env`, the app runs in **local-prototype mode** (seed data, no login,
+nothing persists) — handy for trying it out.
 
 ---
 
 ## 1. Prerequisites (one-time)
 
-**Node.js is required and is not yet installed on this machine.**
+Install **Node.js LTS** from <https://nodejs.org>, then confirm:
 
-1. Download the LTS installer from <https://nodejs.org> (the "LTS" button) and
-   run it. Accept the defaults.
-2. Close and reopen your terminal, then confirm:
-   ```powershell
-   node --version
-   npm --version
-   ```
-   Both should print a version number.
+```powershell
+node --version
+npm --version
+```
 
 ## 2. Run the app locally
 
-From this folder (`Felix ERP SyS`):
-
 ```powershell
-npm install      # first time only — downloads dependencies
-npm run dev      # starts the app, prints a http://localhost:5173 URL
+npm install      # first time only
+npm run dev      # prints a http://localhost:5173 URL
 ```
 
-Open the printed URL in your browser. Others on the same office network can open
-the `http://<your-ip>:5173` URL it also prints.
+Others on the same office network can use the `http://<your-ip>:5173` URL it
+also prints.
 
-> At this stage the app still uses its built-in seed data. Connecting it to the
-> live database is Phase 3.
+## 3. Connect the backend
 
-## 3. Connect the backend (when ready — Phase 2/3)
-
-1. Create a free project at <https://supabase.com>.
-2. In the Supabase dashboard → **SQL Editor**, run, in order:
+1. Create a free project at <https://supabase.com> — click-by-click guide in
+   [`docs/SUPABASE_SETUP.md`](docs/SUPABASE_SETUP.md).
+2. In the Supabase dashboard → **SQL Editor**, run in order:
    - `supabase/schema.sql`
    - `supabase/policies.sql`
-   - `supabase/seed.sql` *(optional — loads the existing reference data)*
-3. Copy `.env.example` to `.env` and fill in your project URL + anon key
-   (dashboard → **Project Settings → API**).
-4. Restart `npm run dev`.
+3. Copy `.env.example` to `.env` and fill in your **Project URL**, **anon
+   public key**, and (for the next step only) the **service_role key**.
+4. Create the 6 staff logins:
+   ```powershell
+   node scripts/setup-supabase.mjs
+   ```
+   Temp password for everyone: `Felix-iQ-2026` (change after first login).
+5. Restart `npm run dev` and sign in. On first load the app seeds the database
+   with the built-in reference data; from then on all data is live and shared
+   between every logged-in user.
 
 ## 4. Build for production
 
 ```powershell
-npm run build    # outputs to dist/
+npm run build    # outputs to dist/ — a self-contained static site
 npm run preview  # serve the production build locally to check it
 ```
 
-`dist/` is what gets deployed (Vercel / Netlify / a server in Egypt — TBD, see
-ARCHITECTURE.md).
+`dist/` is what gets deployed (Netlify / Vercel / a server — TBD).
 
 ---
 
 ## Project layout
 
 ```
-Felix ERP SyS/
-├─ index.html              # app entry
-├─ package.json            # dependencies & scripts
-├─ vite.config.js          # build config
-├─ .env.example            # template for backend keys (copy to .env)
+FM-System/
+├─ index.html                 # app entry (loads Mulish font)
+├─ package.json               # dependencies & scripts
+├─ vite.config.js             # build config
+├─ .env.example               # template for backend keys (copy to .env)
 ├─ src/
-│  ├─ main.jsx             # React bootstrap
-│  ├─ App.jsx              # the ERP app (large, single component for now)
-│  └─ lib/supabase.js      # backend client (used from Phase 3)
+│  ├─ main.jsx                # React bootstrap
+│  ├─ App.jsx                 # the ERP app (single file, ~7,700 lines)
+│  └─ lib/
+│     ├─ supabase.js          # backend client
+│     └─ db.js                # data layer (document model)
 ├─ supabase/
-│  ├─ schema.sql           # database tables
-│  └─ policies.sql         # row-level security (access rules)
+│  ├─ schema.sql              # database tables (run first)
+│  ├─ policies.sql            # row-level security (run second)
+│  └─ migrations/             # incremental schema changes
+├─ scripts/
+│  └─ setup-supabase.mjs      # one-time staff auth bootstrap
 └─ docs/
-   └─ ARCHITECTURE.md      # the plan, decisions, and roadmap
+   ├─ SYSTEM_SPEC.md          # full functional blueprint
+   └─ SUPABASE_SETUP.md       # click-by-click backend setup guide
 ```
 
 ## Security notes
 
-- Never commit `.env`. The `service_role` key must never appear in frontend code.
-- The data here is sensitive (financial records + personal data such as passport
-  copies). Access is gated by Supabase Auth + row-level security.
+- **Never commit `.env`.** The `service_role` key must never appear in frontend
+  code, chat, or version control.
+- The anon key is public by design — Row-Level Security
+  (`supabase/policies.sql`) is what protects the data: the database refuses any
+  read/write that isn't from a signed-in, active Felix staff account.
+- The data is sensitive (financial records + personal data such as passport
+  copies). Access is gated by Supabase Auth + RLS.
