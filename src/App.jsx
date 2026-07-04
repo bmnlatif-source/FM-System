@@ -568,6 +568,125 @@ const FIN_HISTORY = {
 };
 
 // ════════════════════════════════════════════════════════════════════
+// EMAIL → OPERATION (stage 1 of the email integration)
+// Paste-based for now: an enquiry email is parsed into a prefilled operation,
+// and every later message (quote sent/accepted, arrival confirmation, service
+// requests) links onto the op with a lifecycle stage. Stage 2 (live Microsoft
+// 365 shared-inbox via MS Graph) plugs into the same op.emails structure.
+// ════════════════════════════════════════════════════════════════════
+const EMAIL_STAGES = ["Enquiry", "Quote sent", "Quote accepted", "Arrival confirmation", "Service request", "General"];
+const emailStageColor = (s) => ({
+  "Enquiry": [S.goldBg, S.gold], "Quote sent": [S.blueBg, S.blue], "Quote accepted": [S.greenBg, S.green],
+  "Arrival confirmation": [S.cyanBg, S.cyan], "Service request": [S.orangeBg, S.orange],
+}[s] || [S.bg, S.textS]);
+
+// Best-effort extraction from a pasted email. Every field is optional — whatever
+// is found prefills the create form; the operator confirms the rest.
+function parseEmailEnquiry(raw) {
+  const t = raw || "";
+  const out = { from: "", clientName: "", subject: "", vessel: "", loa: "", gt: "", eta: "", ports: [], services: [] };
+  const fromLine = t.match(/^\s*From:\s*(.+)$/im);
+  if (fromLine) {
+    const m = fromLine[1].match(/"?([^"<]+?)"?\s*<([^>]+)>/);
+    if (m) { out.clientName = m[1].trim(); out.from = m[2].trim().toLowerCase(); }
+    else out.from = (fromLine[1].match(/[\w.+-]+@[\w.-]+\.\w+/) || [""])[0].toLowerCase();
+  }
+  if (!out.from) out.from = (t.match(/[\w.+-]+@[\w.-]+\.\w+/) || [""])[0].toLowerCase();
+  const subj = t.match(/^\s*Subject:\s*(.+)$/im);
+  if (subj) out.subject = subj[1].trim();
+  const vessel = t.match(/\b([MS]\/?[YV])\s+([A-Z][A-Za-z0-9' -]{2,30})/);
+  if (vessel) out.vessel = `${vessel[1].toUpperCase().replace(/([MS])(\/?)([YV])/, "$1/$3")} ${vessel[2].trim()}`;
+  const loa = t.match(/(\d{1,3}(?:\.\d+)?)\s*(?:m|meters?|metres?)\b[^\n]{0,12}(?:LOA)?/i) || t.match(/LOA\D{0,8}(\d{1,3}(?:\.\d+)?)/i);
+  if (loa) out.loa = loa[1];
+  const gt = t.match(/(\d[\d,]{0,6})\s*(?:GT|gross\s*tonn?age?)/i);
+  if (gt) out.gt = gt[1].replace(/,/g, "");
+  const eta = t.match(/ETA\D{0,10}(\d{4}-\d{2}-\d{2})/i) || t.match(/(\d{4}-\d{2}-\d{2})/);
+  if (eta) out.eta = eta[1];
+  if (/north\s*bound|N\/?B\b|N\.B\.?/i.test(t)) out.ports.push("SC-NB");
+  else if (/south\s*bound|S\/?B\b|S\.B\.?/i.test(t)) out.ports.push("SC-SB");
+  if (/red sea cruis/i.test(t)) out.ports.push("AREA-RS");
+  PORTS_EG.forEach(p => { if (new RegExp(p.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(t) && !out.ports.includes(p.code)) out.ports.push(p.code); });
+  if (/bunker|fuel|MGO|MDO/i.test(t)) out.services.push("Bunkering");
+  if (/provision|fresh produce|stores/i.test(t)) out.services.push("Provisions");
+  if (/crew\s*change|embark|disembark|sign\s*(on|off)/i.test(t)) out.services.push("Crew change");
+  if (/visa/i.test(t)) out.services.push("Visas");
+  if (/spare|parts|technical/i.test(t)) out.services.push("Spare parts");
+  return out;
+}
+
+// Correspondence tab on the operation: linked emails with lifecycle stages.
+function OpEmailsTab({ op, patchOp }) {
+  const emails = op.emails || [];
+  const [adding, setAdding] = useState(false);
+  const [raw, setRaw] = useState("");
+  const [stage, setStage] = useState("General");
+  const [openId, setOpenId] = useState(null);
+  const link = () => {
+    if (!raw.trim()) return;
+    const p = parseEmailEnquiry(raw);
+    const e = { id: `em${Date.now()}`, dir: "in", stage, from: p.from || "—", subject: p.subject || raw.trim().split("\n")[0].slice(0, 90), body: raw.trim(), date: new Date().toISOString().slice(0, 16).replace("T", " ") };
+    patchOp({ emails: [...emails, e] });
+    // A service-request email should surface on the voyage too — nudge, don't automate silently.
+    setRaw(""); setStage("General"); setAdding(false); setOpenId(e.id);
+  };
+  const remove = (id) => patchOp({ emails: emails.filter(e => e.id !== id) });
+  const setStageOf = (id, s) => patchOp({ emails: emails.map(e => e.id === id ? { ...e, stage: s } : e) });
+  return <>
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+      <div style={{ fontSize: 12, color: S.textS }}>Correspondence — {emails.length} linked email{emails.length === 1 ? "" : "s"} · newest last</div>
+      <div style={{ display: "flex", gap: 6 }}>
+        {op.clientEmail && <a href={`mailto:${op.clientEmail}?subject=${encodeURIComponent(`${op.opNumber} — ${op.vesselName}`)}`} style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 12px", borderRadius: 4, fontSize: 11, fontWeight: 500, border: `1px solid ${S.border}`, color: S.text, textDecoration: "none" }}><ExternalLink size={12} /> Email client</a>}
+        <button onClick={() => setAdding(!adding)} style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 12px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: "pointer", border: `1px solid ${S.brand}`, background: adding ? "transparent" : S.brand, color: adding ? S.brand : "#fff" }}><Plus size={12} /> {adding ? "Cancel" : "Link email"}</button>
+      </div>
+    </div>
+    {adding && <div style={{ background: S.surface, border: `1px solid ${S.brand}40`, borderRadius: 8, padding: 12, marginBottom: 12 }}>
+      <div style={{ fontSize: 11, color: S.textS, marginBottom: 6 }}>Paste the email (headers included if possible — From/Subject are auto-detected) and tag which stage of the operation it belongs to.</div>
+      <textarea value={raw} onChange={e => setRaw(e.target.value)} rows={7} placeholder={"From: Captain Smith <captain@yacht.com>\nSubject: RE: Quote — accepted\n\nWe confirm acceptance of your PDA..."}
+        style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${S.border}`, borderRadius: 6, padding: 10, fontSize: 12, fontFamily: "inherit", resize: "vertical" }} />
+      <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+        <span style={{ fontSize: 11, color: S.textS }}>Stage:</span>
+        <select value={stage} onChange={e => setStage(e.target.value)} style={{ border: `1px solid ${S.border}`, borderRadius: 4, padding: "4px 8px", fontSize: 12 }}>{EMAIL_STAGES.map(s => <option key={s}>{s}</option>)}</select>
+        <span style={{ flex: 1 }} />
+        <button onClick={link} disabled={!raw.trim()} style={{ padding: "6px 16px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: raw.trim() ? "pointer" : "default", border: "none", background: raw.trim() ? S.brand : S.border, color: raw.trim() ? "#fff" : S.textH }}>Link to {op.opNumber}</button>
+      </div>
+    </div>}
+    {emails.length === 0 && !adding && <div style={{ background: S.surface, border: `1px dashed ${S.border}`, borderRadius: 8, padding: "36px 24px", textAlign: "center" }}>
+      <div style={{ width: 44, height: 44, borderRadius: 10, background: S.brandL, display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: 10 }}><MessageCircle size={20} color={S.brand} /></div>
+      <div style={{ fontSize: 13, fontWeight: 500, color: S.text, marginBottom: 4 }}>No emails linked yet</div>
+      <div style={{ fontSize: 12, color: S.textS, maxWidth: 420, margin: "0 auto" }}>Link the enquiry, your quote, the acceptance, arrival confirmations and service requests here — the whole email thread of the operation in one place.</div>
+    </div>}
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {emails.map(e => {
+        const [bg, fg] = emailStageColor(e.stage);
+        const open = openId === e.id;
+        return <div key={e.id} style={{ background: S.surface, border: `1px solid ${S.border}`, borderRadius: 8, overflow: "hidden" }}>
+          <div onClick={() => setOpenId(open ? null : e.id)} style={{ padding: "10px 14px", display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
+            <MessageCircle size={15} style={{ color: S.brand, flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 500, color: S.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.subject}</div>
+              <div style={{ fontSize: 11, color: S.textS }}>{e.from} · {e.date}</div>
+            </div>
+            <span style={{ padding: "2px 9px", borderRadius: 10, fontSize: 10.5, fontWeight: 500, background: bg, color: fg, flexShrink: 0 }}>{e.stage}</span>
+            <ChevronDown size={15} style={{ color: S.textH, transform: open ? "rotate(180deg)" : "none", transition: ".15s", flexShrink: 0 }} />
+          </div>
+          {open && <div style={{ borderTop: `1px solid ${S.borderL}`, padding: "12px 14px" }}>
+            <pre style={{ margin: 0, fontFamily: "inherit", fontSize: 12, color: S.text, whiteSpace: "pre-wrap", lineHeight: 1.5, maxHeight: 260, overflowY: "auto" }}>{e.body}</pre>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <span style={{ fontSize: 10.5, color: S.textS }}>Stage:</span>
+              <select value={e.stage} onChange={ev => setStageOf(e.id, ev.target.value)} style={{ border: `1px solid ${S.border}`, borderRadius: 4, padding: "3px 6px", fontSize: 11 }}>{EMAIL_STAGES.map(s => <option key={s}>{s}</option>)}</select>
+              {e.from && e.from !== "—" && <a href={`mailto:${e.from}?subject=${encodeURIComponent(`RE: ${e.subject} [${op.opNumber}]`)}`} style={{ fontSize: 11, color: S.brand, display: "flex", alignItems: "center", gap: 3, textDecoration: "none" }}><ExternalLink size={11} /> Reply</a>}
+              {e.stage === "Service request" && <span style={{ fontSize: 10.5, color: S.textS, background: S.orangeBg, padding: "2px 8px", borderRadius: 4 }}>→ add the service on the Voyage tab so it shows on the journey timeline</span>}
+              <span style={{ flex: 1 }} />
+              <button onClick={() => remove(e.id)} style={{ fontSize: 11, color: S.red, border: "none", background: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 3 }}><Trash2 size={11} /> Unlink</button>
+            </div>
+          </div>}
+        </div>;
+      })}
+    </div>
+  </>;
+}
+
+// ════════════════════════════════════════════════════════════════════
 // SC TRANSIT PACKAGES — vessels below 300 tons (PDA/FDA builder)
 // Hierarchical: groups (SN item) → sub-items. `internalNote` is employee-only,
 // NEVER rendered on the PDA/FDA document. `onRequest` rows print "On request"
@@ -3001,6 +3120,9 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
   const [activeTab, setActiveTab] = useState("timeline");
   const [selectedPda, setSelectedPda] = useState(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [emailImport, setEmailImport] = useState(false);   // "Create from email" paste panel
+  const [emailRaw, setEmailRaw] = useState("");
+  const [pendingEmail, setPendingEmail] = useState(null);  // parsed enquiry email, attached to the op on create
   const ops = allOps || OPERATIONS;
   const [voyagePlans, setVoyagePlans] = useState({});
   const [showAddVessel, setShowAddVessel] = useState(false);
@@ -3101,6 +3223,7 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
       baseCurrency: form.baseCurrency, staffId: user?.id || form.staffId, created: "2026-05-18", notes: form.notes,
       timestamps: { enquiryReceived: new Date().toISOString(), ...(status === "Upcoming" ? { confirmed: new Date().toISOString() } : {}) },
       serviceCount: 0, pdaCount: 0, fdaCount: 0, totalRevenue: 0, totalCost: 0,
+      emails: pendingEmail ? [pendingEmail] : [],   // the enquiry email that started this op, if created from one
     };
     addOp(newOp);
     // Keep the vessel profile in sync: if a linked vessel's facts (flag/LOA/GT/IMO) were
@@ -3119,8 +3242,22 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
     }
     setForm(emptyForm);
     setShowCreate(false);
+    setPendingEmail(null);
     setSelectedOp(newOp);
     setActiveTab("timeline");
+  };
+
+  // "Create from email": parse the pasted enquiry, prefill the create form, and
+  // keep the original message to attach to the operation on save.
+  const startFromEmail = () => {
+    if (!emailRaw.trim()) return;
+    const p = parseEmailEnquiry(emailRaw);
+    setPendingEmail({ id: `em${Date.now()}`, dir: "in", stage: "Enquiry", from: p.from || "—", subject: p.subject || emailRaw.trim().split("\n")[0].slice(0, 90), body: emailRaw.trim(), date: new Date().toISOString().slice(0, 16).replace("T", " ") });
+    setForm(f => ({ ...f, opType: "enquiry",
+      vesselName: p.vessel || f.vesselName, clientName: p.clientName || f.clientName, clientEmail: p.from || f.clientEmail,
+      vesselLoa: p.loa || f.vesselLoa, vesselGt: p.gt || f.vesselGt, ports: p.ports.length ? p.ports : f.ports, eta: p.eta || f.eta,
+      notes: [p.services.length ? `Requested services (from email): ${p.services.join(", ")}` : "", f.notes].filter(Boolean).join("\n") }));
+    setEmailImport(false); setEmailRaw(""); setShowCreate(true);
   };
 
   const goToPdaBuilder = () => { setActiveTab("pda"); setSelectedPda(null); setEditPdaItems(null); setShowPdaBuilder(true); setPdaCart([]); };
@@ -3455,6 +3592,7 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
       { key: "pda", label: `PDA (${op.pdaCount})` },
       { key: "fda", label: `FDA (${op.fdaCount})` },
       { key: "crew", label: "Crew & Guests" },
+      { key: "emails", label: `Emails (${(op.emails || []).length})` },
       { key: "docs", label: "Documents" },
     ];
 
@@ -4245,6 +4383,7 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
           })()}
 
           {/* CREW/GUESTS/DOCS — placeholder */}
+          {activeTab === "emails" && <OpEmailsTab op={op} patchOp={patchOp} />}
           {activeTab === "docs" && <VesselDocsTab op={op} yacht={yacht} />}
 
           {activeTab === "crew" && <CrewGuestsTab op={op} yacht={yacht} />}
@@ -4474,7 +4613,21 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
       })}
     </div>
     <FilterBar filters={all} active={filter} onToggle={toggle} count={filtered.length} />
+    <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: -34, position: "relative", zIndex: 2, paddingRight: 210 }}>
+      <button onClick={() => setEmailImport(!emailImport)} style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 12px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: "pointer", border: `1px solid ${S.brand}`, background: emailImport ? S.brand : "transparent", color: emailImport ? "#fff" : S.brand, marginTop: 6 }}><MessageCircle size={12} /> Create from email</button>
+    </div>
     <Toolbar title="Operations — list report (Section 3)" onCreate={() => setShowCreate(true)} />
+    {emailImport && <div style={{ background: S.surface, border: `1px solid ${S.brand}40`, borderRadius: 8, padding: 14, marginBottom: 12 }}>
+      <div style={{ fontSize: 12, fontWeight: 500, color: S.navy, marginBottom: 4 }}>New operation from an email enquiry</div>
+      <div style={{ fontSize: 11, color: S.textS, marginBottom: 8 }}>Paste the client's email below (with the From/Subject lines if possible). Felix iQ extracts the vessel, route (Suez NB/SB), LOA/GT, ETA, client and requested services, prefills the create form, and attaches the original email to the operation.</div>
+      <textarea value={emailRaw} onChange={e => setEmailRaw(e.target.value)} rows={8}
+        placeholder={"From: Captain John Smith <captain@myaurora.com>\nSubject: Quote request — Suez Canal transit NB\n\nGood day,\nWe are M/Y AURORA, 42m LOA, 380 GT, flag Malta.\nRequesting a quote for a northbound Suez Canal transit, ETA 2026-08-14.\nWe would also need bunkers (MGO) at Ismailia and a crew change in Port Said.\nBest regards"}
+        style={{ width: "100%", boxSizing: "border-box", border: `1px solid ${S.border}`, borderRadius: 6, padding: 10, fontSize: 12, fontFamily: "inherit", resize: "vertical" }} />
+      <div style={{ display: "flex", gap: 8, marginTop: 8, justifyContent: "flex-end" }}>
+        <button onClick={() => { setEmailImport(false); setEmailRaw(""); }} style={{ padding: "6px 14px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: "pointer", border: `1px solid ${S.border}`, background: "transparent", color: S.textS }}>Cancel</button>
+        <button onClick={startFromEmail} disabled={!emailRaw.trim()} style={{ display: "flex", alignItems: "center", gap: 4, padding: "6px 16px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: emailRaw.trim() ? "pointer" : "default", border: "none", background: emailRaw.trim() ? S.orange : S.border, color: emailRaw.trim() ? "#fff" : S.textH }}><Check size={12} /> Parse &amp; prefill operation</button>
+      </div>
+    </div>}
     <div style={{ background: S.surface, border: `1px solid ${S.border}`, borderRadius: "0 0 8px 8px", overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
         <thead><tr style={{ background: "#F2F2F2" }}>
