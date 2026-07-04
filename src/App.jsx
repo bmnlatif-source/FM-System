@@ -513,6 +513,17 @@ const FIN_BASELINE = { gaExpenses: 3200 };
 const ENTITY_CODE = { "Felix Maritime Agency": "FMA", "German Agency": "GRA", "Cruising Agency": "CRA" };
 const fdaDocTotal = (d) => (d.items || []).reduce((s, i) => s + (Number(i.actualAmount != null ? i.actualAmount : (Number(i.qty) || 0) * (Number(i.price) || 0)) || 0), 0);
 const fdaDocVat = (d) => (d.items || []).reduce((s, i) => s + ((Number(i.qty) || 0) * (Number(i.price) || 0) * (Number(i.vat) || 0) / 100), 0);
+// Pass-through vs agency-fee classification (audit B01, pending Finance sign-off).
+// Default: third-party tolls/government fees billed onward = pass-through disbursements
+// (client money, NOT revenue); only Felix's own fee/commission lines are revenue.
+// An explicit line.feeType always wins over the name heuristic.
+const AGENCY_FEE_RX = /agency\s*fee|agency\s*commission|agency\s*attendance|meet\s*(&|and)\s*assist|handling|supervision|coordination|attendance/i;
+const lineFeeType = (l) => l.feeType || (AGENCY_FEE_RX.test(`${l.name || ""} ${l.svc || ""} ${l.group || ""}`) ? "Agency fee" : "Disbursement");
+const fdaDocSplit = (d) => (d.items || []).reduce((acc, i) => {
+  const amt = Number(i.actualAmount != null ? i.actualAmount : (Number(i.qty) || 0) * (Number(i.price) || 0)) || 0;
+  if (lineFeeType(i) === "Agency fee") acc.fee += amt; else acc.passThrough += amt;
+  return acc;
+}, { fee: 0, passThrough: 0 });
 // Live financial position from the operations list. Per entity: FDA-invoice counts,
 // value, paid/unpaid split, AR (unpaid FDA totals). Unbilled = op revenue with no FDA
 // issued yet (accrued, flagged separately from true AR). GL: revenue/cost from op
@@ -520,12 +531,14 @@ const fdaDocVat = (d) => (d.items || []).reduce((s, i) => s + ((Number(i.qty) ||
 function computeFinance(ops) {
   const blank = () => ({ inv: 0, usd: 0, paid: 0, unpaid: 0, ar: 0, unbilled: 0 });
   const per = { FMA: blank(), GRA: blank(), CRA: blank() };
-  let revenue = 0, cost = 0, vat = 0;
+  let revenue = 0, cost = 0, vat = 0, feeRevenue = 0, passThrough = 0;
   (ops || []).forEach(op => {
     const p = per[ENTITY_CODE[op.entity] || "FMA"];
     const fdas = op.fdas || [];
     fdas.forEach(f => {
       const t = fdaDocTotal(f);
+      const split = fdaDocSplit(f);
+      feeRevenue += split.fee; passThrough += split.passThrough;
       p.inv++; p.usd += t;
       if (f.paymentStatus === "Paid") p.paid++; else { p.unpaid++; p.ar += t; }
       if (f.status === "Released" || f.glPosted) vat += fdaDocVat(f);
@@ -541,6 +554,9 @@ function computeFinance(ops) {
     totalRevenue: r2(revenue), totalCost: r2(cost), grossProfit,
     gaExpenses: FIN_BASELINE.gaExpenses, netIncome: r2(grossProfit - FIN_BASELINE.gaExpenses),
     arBalance: r2(sum("ar")), unbilled: r2(sum("unbilled")), vatPayable: r2(vat),
+    // Audit B01: gross billings ≠ revenue. Fee lines = Felix income; pass-through = client
+    // money owed onward to SCA/ports/government (an "advances from principals" liability).
+    netAgencyIncome: r2(feeRevenue), passThroughBilled: r2(passThrough),
   } };
 }
 // Pre-ERP invoice history (imported from the accounting records, fixed). Live ERP
@@ -558,6 +574,7 @@ const FIN_HISTORY = {
 // until priced. `autoCalc:"canalDues"` = SCNT×5×SDR from vessel dims + live SDR.
 // ════════════════════════════════════════════════════════════════════
 const DEFAULT_SDR = 1.3682;
+const FX_RATE_EGP = 50.85; // EGP per USD — persisted onto PDAs so documents stay auditable when the rate moves (audit B05)
 const SUB300_GROUPS_COMMON = {
   dues: { name: "SUEZ CANAL DUES", unit: "Per transit", subs: [
     { name: "Canal transit dues (per net ton)", autoCalc: "canalDues", qty: 1, include: true, internalNote: "Based on vessel tonnage certificate — and the SDR on the time of Transit. (L×W×D)/2.82 = SCNT; SCNT×(5×SDR) = USD dues. Rate auto-fills from the calc bar — override allowed." },
@@ -2880,10 +2897,13 @@ function Sub300Builder({ pkg, op, yacht, onSave, onCancel, externalAddRef }) {
         vat: s.vat === "" || s.vat == null ? null : parseFloat(s.vat) || 0,
         amount: effAmount(s),
         note: s.note || "", internalNote: s.autoCalc ? `${s.internalNote || ""} [SCNT ${scnt} × 5 SDR @ ${sdr} = $${duesAmt}]`.trim() : (s.internalNote || ""),
+        feeType: lineFeeType({ name: s.name, group: g.name }), // pass-through vs agency fee (audit B01) — explicit on the line, overridable
       });
     }));
     if (!lines.length) { alert("Nothing to save — include at least one item."); return; }
-    onSave(lines, paymentTerms);
+    // Rates travel with the document (audit B05): the SDR used for canal dues and the EGP
+    // rate used for EGP-derived prices, so the PDA is auditable after rates move.
+    onSave(lines, paymentTerms, { sdrRate: parseFloat(sdr) || DEFAULT_SDR, egpRate: FX_RATE_EGP, scnt });
   };
 
   const num = { width: 68, border: `1px solid ${S.border}`, borderRadius: 3, padding: "3px 5px", fontSize: 11, background: S.surface, boxSizing: "border-box", textAlign: "right" };
@@ -2991,7 +3011,7 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
   const sub300AddRef = useRef(null);   // registered by Sub300Builder — routes catalog "Add" clicks into the open builder
   const [editPdaItems, setEditPdaItems] = useState(null);
   const [pdaDiscount, setPdaDiscount] = useState({ desc: "", amount: 0, mode: "fixed", pct: 0 });
-  const emptyForm = { vesselName: "", yachtId: "", clientName: "", clientEmail: "", vesselLoa: "", vesselGt: "", vesselFlag: "", vesselImo: "", ports: [], eta: "", etd: "", lastPort: "", nextPort: "", baseCurrency: "USD", opType: "enquiry", staffId: "s1", notes: "", newVesselName: "" };
+  const emptyForm = { vesselName: "", yachtId: "", clientName: "", clientEmail: "", vesselLoa: "", vesselGt: "", vesselFlag: "", vesselImo: "", ports: [], eta: "", etd: "", lastPort: "", nextPort: "", baseCurrency: "USD", opType: "enquiry", staffId: "s1", notes: "", newVesselName: "", charterStatus: "Auto (from vessel)" };
   const [form, setForm] = useState(emptyForm);
   useEffect(() => { if (intent === "create" || (intent && intent.create)) { setSelectedOp(null); setShowCreate(true); const yk = intent && intent.yacht; if (yk) { const ow = owners.find(o => o.id === yk.ownerId); setForm(f => ({ ...f, yachtId: yk.id, vesselName: yk.name, vesselLoa: yk.loa, vesselGt: yk.gt, vesselFlag: yk.flag, vesselImo: yk.imo || "", clientName: ow?.name || f.clientName, clientEmail: ow?.email || f.clientEmail })); } clearIntent && clearIntent(); } else if (intent && intent.openOp) { const target = (allOps || OPERATIONS).find(o => o.id === intent.openOp); if (target) { setSelectedOp(target); setActiveTab(intent.tab || "timeline"); } clearIntent && clearIntent(); } }, []);
   const updateForm = (k, v) => setForm(f => ({ ...f, [k]: v }));
@@ -3076,6 +3096,8 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
       id: `op${Date.now()}`, opNumber: nextOpNum, status, entity: formEntity, vesselName: form.vesselName || "Vessel TBC", yachtId: form.yachtId || null,
       clientName: form.clientName || "Client TBC", clientEmail: form.clientEmail, vesselLoa: Number(form.vesselLoa) || null, vesselGt: Number(form.vesselGt) || null,
       vesselFlag: form.vesselFlag || "TBC", ports: form.ports, eta: form.eta || null, etd: form.etd || null, lastPort: form.lastPort || null, nextPort: form.nextPort || null,
+      // Private vs commercial-charter (audit B04): per-op override, else derived from the vessel's charterable flag. VAT rules read this, not flag alone (B13).
+      charterStatus: form.charterStatus !== "Auto (from vessel)" ? form.charterStatus : (yachts.find(x => x.id === form.yachtId)?.charterable ? "Commercial charter" : "Private"),
       baseCurrency: form.baseCurrency, staffId: user?.id || form.staffId, created: "2026-05-18", notes: form.notes,
       timestamps: { enquiryReceived: new Date().toISOString(), ...(status === "Upcoming" ? { confirmed: new Date().toISOString() } : {}) },
       serviceCount: 0, pdaCount: 0, fdaCount: 0, totalRevenue: 0, totalCost: 0,
@@ -3265,7 +3287,7 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
 
   // Save from the hierarchical sub-300 builder: same numbering/persistence pipeline as
   // the cart, plus sub300 flag (drives the T&C block on the document).
-  const saveSub300Pda = (lines, payTerms) => {
+  const saveSub300Pda = (lines, payTerms, rates = {}) => {
     if (!selectedOp || !lines.length) return;
     const entity = opAgencyCode(selectedOp);
     const month = "05";
@@ -3280,6 +3302,9 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
       client: selectedOp.clientName || "Client TBC", clientEmail: selectedOp.clientEmail || "", billingAddress: "",
       staff: staff?.name || "—", staffTitle: "Operations Manager",
       items: lines,
+      // Audit B05: rate context + computed total stored on the document itself.
+      sdrRate: rates.sdrRate ?? null, egpRate: rates.egpRate ?? null, scnt: rates.scnt ?? null,
+      total: Math.round(lines.reduce((a, l) => a + (Number(l.amount) || 0) * (1 + (Number(l.vat) || 0) / 100), 0) * 100) / 100,
     };
     updateCreatedPdas(prev => ({ ...prev, [pdaNum]: newPda }));
     setShowPdaBuilder(false); setSub300Pkg(null);
@@ -4319,11 +4344,12 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
 
           {/* Manual / override fields */}
           <div style={{ fontSize: 11, color: S.textH, marginBottom: 6 }}>Or enter manually{form.yachtId ? " (override auto-filled values)" : ""}:</div>
-          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr", gap: 12, marginBottom: 18 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", gap: 12, marginBottom: 18 }}>
             <FW label={`Vessel name${isEnquiry ? "" : ""}`} hint={isEnquiry ? "Optional — enter if known" : undefined}><input style={inp} value={form.vesselName} onChange={e => updateForm("vesselName", e.target.value)} placeholder={isEnquiry ? "Optional — vessel TBC" : "e.g. M/Y Champagne Seas"} /></FW>
             <FW label={`Est. LOA (m)${isEnquiry ? " *" : ""}`} hint="For port dues calc"><input style={inp} type="number" value={form.vesselLoa} onChange={e => updateForm("vesselLoa", e.target.value)} placeholder="62" /></FW>
             <FW label={`Est. GT${isEnquiry ? " *" : ""}`} hint="For tariff calc"><input style={inp} type="number" value={form.vesselGt} onChange={e => updateForm("vesselGt", e.target.value)} placeholder="1180" /></FW>
             <FW label="Flag"><SearchSelect value={form.vesselFlag} options={FLAG_COUNTRIES} placeholder="Select..." width="100%" onChange={v => updateForm("vesselFlag", v)} /></FW>
+            <FW label="Charter status" hint="Drives VAT — flag alone isn't enough"><select style={inp} value={form.charterStatus} onChange={e => updateForm("charterStatus", e.target.value)}><option>Auto (from vessel)</option><option>Private</option><option>Commercial charter</option></select></FW>
           </div>
 
           {/* ── Client Section ── */}
@@ -6486,7 +6512,7 @@ const TransitView = () => {
       { key: "ismailiaStop", label: "Ismailia Stop" },
       { key: "status", label: "Status", render: v => <Status value={v} /> },
     ]} data={rows} />
-    <InfoStrip type="warning"><strong>Auto-derived status:</strong> Planned → At Anchorage → Cleared → Underway → At Ismailia → Underway (2nd) → Completed. Only Cancelled is manual.</InfoStrip>
+    <InfoStrip type="warning"><strong>Event → status mapping (audit B11):</strong> each logged event advances the status — anchorage arrival → At Anchorage · inspection passed → Cleared · pilot boarded → Underway · Ismailia berthing (branch: only when Ismailia stop = Yes) → At Ismailia · departure → Underway (2nd) · exit pilot off → Completed. Southbound and Northbound follow the same chain with mirrored entry points (Port Said vs Suez). Only Cancelled is manual. <strong>Status reflects the last logged event</strong> — not live vessel position (AIS feed is Phase 2).</InfoStrip>
     <InfoStrip type="info"><strong>Ismailia default:</strong> GT &gt; 300 → No stop. GT ≤ 300 + crew change → Yes. Ismailia ETA/ETD editable only by Ismailia office (s6) and admin (s1).</InfoStrip>
   </>;
 };
@@ -6496,10 +6522,15 @@ const CrewChangeView = () => {
   const [rows, setRows] = useState(CREW_CHANGES);
   const [f, setF] = useState(["All"]);
   const [adding, setAdding] = useState(false);
-  const blank = { yacht: "", type: "Embark", crewName: "", role: "", nationality: "", port: PORTS_EG[0].name, date: "", visaMethod: VISA_METHODS[0] };
+  const blank = { agency: "FMA", yacht: "", type: "Embark", crewName: "", role: "", nationality: "", port: PORTS_EG[0].name, date: "", visaMethod: VISA_METHODS[0] };
   const [nc, setNc] = useState(blank);
   const ok = nc.yacht && nc.crewName;
-  const save = () => { if (!ok) return; setRows(p => [{ id: "CC-" + Date.now(), phase: 1, glStatus: "", visa: "Pending", status: "Upcoming", restricted: false, ...nc }, ...p]); setNc(blank); setAdding(false); };
+  // Entity-namespaced refs (audit B15: {ENTITY}-{TYPE}-{YEAR}-{SEQ}); restricted flag derived from the nationality list (audit B06) — never defaulted off.
+  const save = () => {
+    if (!ok) return;
+    setRows(p => [{ id: `${nc.agency}-CC-${new Date().getFullYear()}-${String(p.length + 1).padStart(3, "0")}`, phase: 1, glStatus: isRestricted(nc.nationality) ? "Drafted" : "", visa: "Pending", status: "Upcoming", ...nc, restricted: isRestricted(nc.nationality) }, ...p]);
+    setNc(blank); setAdding(false);
+  };
   const types = ["All", "Embark", "Disembark"];
   const filtered = rows.filter(c => f.includes("All") || f.includes(c.type));
   const toggle = v => { if (v === "All") return setF(["All"]); const n = f.filter(s => s !== "All"); setF(n.includes(v) ? (n.length === 1 ? ["All"] : n.filter(s => s !== v)) : [...n, v]); };
@@ -6516,6 +6547,7 @@ const CrewChangeView = () => {
     {adding && <div style={{ background: S.surface, border: `1px solid ${S.brand}40`, borderRadius: 6, padding: 12, marginBottom: 10 }}>
       <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 8 }}>New crew change</div>
       <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <FSelect label="Agency" val={nc.agency} set={v => setNc({ ...nc, agency: v })} opts={["FMA", "GRA", "CRA"]} />
         <FField label="Vessel *" val={nc.yacht} set={v => setNc({ ...nc, yacht: v })} w={2} />
         <FSelect label="Type" val={nc.type} set={v => setNc({ ...nc, type: v })} opts={["Embark", "Disembark"]} />
         <FField label="Crew member *" val={nc.crewName} set={v => setNc({ ...nc, crewName: v })} w={2} />
@@ -6555,7 +6587,9 @@ const VisaView = () => {
   const blank = { batchRef: "", type: "Tourist Visa", code: "", totalStickers: "", costPerSticker: "", dateReceived: "", expiry: "" };
   const [nb, setNb] = useState(blank);
   const ok = nb.batchRef && nb.type;
-  const save = () => { if (!ok) return; const tot = Number(nb.totalStickers) || 0; setRows(p => [{ id: "vb" + Date.now(), batchRef: nb.batchRef, type: nb.type, code: nb.code, totalStickers: tot, available: tot, assigned: 0, used: 0, costPerSticker: Number(nb.costPerSticker) || 0, dateReceived: nb.dateReceived, expiry: nb.expiry }, ...p]); setNb(blank); setAdding(false); };
+  const save = () => { if (!ok) return; const tot = Number(nb.totalStickers) || 0; setRows(p => [{ id: "vb" + Date.now(), batchRef: nb.batchRef, type: nb.type, code: nb.code, totalStickers: tot, available: tot, assigned: 0, used: 0, costPerSticker: Number(nb.costPerSticker) || 0, dateReceived: nb.dateReceived, expiry: nb.expiry, status: "Active" }, ...p]); setNb(blank); setAdding(false); };
+  // Batch status (audit B06): derived when absent — Expired past expiry, Depleted at 0 available, else Active.
+  const batchStatus = (b) => b.status === "Archived" ? "Archived" : (b.expiry && new Date(b.expiry) < new Date()) ? "Expired" : b.available === 0 ? "Depleted" : "Active";
   return <>
   <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
     {rows.map(b => {
@@ -6590,6 +6624,7 @@ const VisaView = () => {
     { key: "costPerSticker", label: "Cost/Unit", render: v => `$${v}` },
     { key: "dateReceived", label: "Received" },
     { key: "expiry", label: "Expiry", render: v => { const d = new Date(v); const soon = d < new Date("2026-09-01"); return <span style={{ color: soon ? S.orange : S.text }}>{v}</span>; } },
+    { key: "status", label: "Status", render: (v, r) => { const s = batchStatus(r); const c = s === "Active" ? [S.greenBg, S.green] : s === "Depleted" ? [S.goldBg, S.gold] : [S.redBg, S.red]; return <span style={{ padding: "2px 8px", borderRadius: 10, fontSize: 10.5, fontWeight: 500, background: c[0], color: c[1] }}>{s}</span>; } },
   ]} data={rows} />
   <InfoStrip type="info"><strong>Sticker lifecycle:</strong> Available → Assigned (on selection) → Used (on immigration completion). De-allocation returns to Available with reason.</InfoStrip>
   </>;
@@ -6600,10 +6635,17 @@ const LogisticsView = ({ initialTab }) => {
   const [rows, setRows] = useState(LOGISTICS);
   const [tab, setTab] = useState(initialTab || "all");
   const [adding, setAdding] = useState(false);
-  const blank = { yacht: "", type: initialTab === "bunker" ? "Bunker" : "Provision", code: "", desc: "", port: "", supplier: "", value: "", currency: "USD" };
+  const blank = { agency: "FMA", yacht: "", type: initialTab === "bunker" ? "Bunker" : "Provision", code: "", desc: "", port: "", supplier: "", value: "", currency: "USD", bunkerGrade: "", qtyOrdered: "", customsEntryNo: "" };
   const [nl, setNl] = useState(blank);
   const ok = nl.yacht && nl.desc;
-  const save = () => { if (!ok) return; setRows(p => [{ id: "lg" + Date.now(), yacht: nl.yacht, type: nl.type, code: nl.code, desc: nl.desc, port: nl.port, supplier: nl.supplier, date: new Date().toISOString().slice(0, 10), value: Number(nl.value) || 0, currency: nl.currency, status: "Requested" }, ...p]); setNl(blank); setAdding(false); };
+  // Entity-namespaced order IDs (audit B15) + bunker/customs fields the rules depend on (audit B06).
+  const save = () => {
+    if (!ok) return;
+    setRows(p => [{ id: `${nl.agency}-LOG-${new Date().getFullYear()}-${String(p.length + 1).padStart(3, "0")}`, yacht: nl.yacht, type: nl.type, code: nl.code, desc: nl.desc, port: nl.port, supplier: nl.supplier, date: new Date().toISOString().slice(0, 10), value: Number(nl.value) || 0, currency: nl.currency, status: "Requested",
+      ...(nl.type === "Bunker" ? { bunkerGrade: nl.bunkerGrade, qtyOrdered: Number(nl.qtyOrdered) || 0, bunkerStatus: "Request Received" } : {}),
+      ...(nl.customsEntryNo ? { customsEntryNo: nl.customsEntryNo } : {}) }, ...p]);
+    setNl(blank); setAdding(false);
+  };
   const tabs = [{ key: "all", label: "All orders", count: rows.length }, { key: "provision", label: "Provisions", count: rows.filter(l => l.type === "Provision").length }, { key: "bunker", label: "Bunker", count: rows.filter(l => l.type === "Bunker").length }, { key: "parts", label: "Parts & Technical", count: rows.filter(l => l.type === "Spare Parts" || l.type === "Technical").length }];
   const filtered = tab === "all" ? rows : rows.filter(l => tab === "provision" ? l.type === "Provision" : tab === "bunker" ? l.type === "Bunker" : l.type === "Spare Parts" || l.type === "Technical");
   return <>
@@ -6618,6 +6660,7 @@ const LogisticsView = ({ initialTab }) => {
     {adding && <div style={{ background: S.surface, border: `1px solid ${S.brand}40`, borderRadius: 6, padding: 12, marginBottom: 10 }}>
       <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 8 }}>New supply request</div>
       <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <FSelect label="Agency" val={nl.agency} set={v => setNl({ ...nl, agency: v })} opts={["FMA", "GRA", "CRA"]} />
         <FField label="Vessel *" val={nl.yacht} set={v => setNl({ ...nl, yacht: v })} w={2} />
         <FSelect label="Type" val={nl.type} set={v => setNl({ ...nl, type: v })} opts={["Provision", "Bunker", "Spare Parts", "Technical"]} />
         <FField label="Code" val={nl.code} set={v => setNl({ ...nl, code: v })} ph="SUP-0.." />
@@ -6630,7 +6673,11 @@ const LogisticsView = ({ initialTab }) => {
       <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
         <FField label="Value" val={nl.value} set={v => setNl({ ...nl, value: v })} type="number" />
         <FSelect label="Currency" val={nl.currency} set={v => setNl({ ...nl, currency: v })} opts={["USD", "EUR", "EGP"]} />
-        <div style={{ flex: 2 }} />
+        {nl.type === "Bunker" ? <>
+          <FSelect label="Fuel grade" val={nl.bunkerGrade} set={v => setNl({ ...nl, bunkerGrade: v })} opts={["", "MGO", "MDO", "IFO 180", "IFO 380", "LSFO"]} />
+          <FField label="Qty ordered (L)" val={nl.qtyOrdered} set={v => setNl({ ...nl, qtyOrdered: v })} type="number" />
+        </> : <FField label="Customs entry no." val={nl.customsEntryNo} set={v => setNl({ ...nl, customsEntryNo: v })} ph="optional" />}
+        <div style={{ flex: 1 }} />
       </div>
       <SaveBtn ok={ok} onClick={save} label="Save supply request" />
     </div>}
@@ -6646,7 +6693,7 @@ const LogisticsView = ({ initialTab }) => {
       { key: "value", label: "Value", render: (v, r) => <span style={{ fontWeight: 600, color: S.gold }}>{r.currency === "EUR" ? "€" : "$"}{v.toLocaleString()}</span> },
       { key: "status", label: "Status", render: v => <Status value={v} /> },
     ]} data={filtered} />
-    {tab === "bunker" && <InfoStrip type="info"><strong>Bunker pipeline (Section 14):</strong> Request Received → Vendor Assigned → In Progress → Awaiting BDN → Completed. VAT auto-derives from flag: foreign = exempt, Egyptian = 14%.</InfoStrip>}
+    {tab === "bunker" && <InfoStrip type="info"><strong>Bunker pipeline (Section 14):</strong> Request Received → Vendor Assigned → In Progress → Awaiting BDN → Completed. <strong>VAT</strong> is determined by service type <em>and</em> vessel status — not flag alone (audit B13): foreign-flag <em>private</em> vessels in transit = exempt; Egyptian-flag or <em>commercial-charter</em> operation = 14%. Pending confirmation with the Egyptian tax advisor.</InfoStrip>}
   </>;
 };
 
@@ -6772,12 +6819,16 @@ const FinanceView = ({ activeEntity, allOps }) => {
     { code: "1020", name: "Cash — USD", type: "Asset", balance: bsSum("cashUsd") },
     { code: "1030", name: "Cash — EUR", type: "Asset", balance: bsSum("cashEur") },
     { code: "1210", name: "Accounts Receivable", type: "Asset", balance: bsSum("ar") + live.gl.arBalance + live.gl.unbilled },
+    { code: "1220", name: "VAT Receivable (input VAT)", type: "Asset", balance: 0 },
     { code: "1310", name: "Prepaid Expenses", type: "Asset", balance: 0 },
     { code: "2010", name: "Accounts Payable", type: "Liability", balance: bsSum("ap") },
     { code: "2020", name: "VAT Payable", type: "Liability", balance: live.gl.vatPayable },
     { code: "2030", name: "Accrued Liabilities", type: "Liability", balance: 0 },
+    // Client float held for onward payment to SCA/ports/government — pass-through money, never revenue (audit B01/B03).
+    { code: "2040", name: "Advances from Principals (client funds)", type: "Liability", balance: live.gl.passThroughBilled },
     { code: "3010", name: "Owner's Equity / Capital", type: "Equity", balance: 0 },
     { code: "3020", name: "Retained Earnings", type: "Equity", balance: 0 },
+    { code: "3030", name: "Cumulative Translation Adjustment (CTA)", type: "Equity", balance: 0 },
     { code: "4010", name: "Agency Fee Revenue", type: "Revenue", balance: 12400 },
     { code: "4020", name: "Transit Revenue", type: "Revenue", balance: 18600 },
     { code: "4030", name: "Port Call Revenue", type: "Revenue", balance: 6200 },
@@ -6786,6 +6837,7 @@ const FinanceView = ({ activeEntity, allOps }) => {
     { code: "4060", name: "Supply & Logistics Revenue", type: "Revenue", balance: 2800 },
     { code: "4070", name: "Chartering Revenue", type: "Revenue", balance: 1500 },
     { code: "4099", name: "Other Revenue", type: "Revenue", balance: 800 },
+    { code: "4910", name: "FX Gain / (Loss) — realised", type: "Revenue", balance: 0 },
     { code: "5010", name: "Cost of Services — Port & Canal", type: "Expense", balance: 14200 },
     { code: "5020", name: "Cost of Services — Bunkering", type: "Expense", balance: 4800 },
     { code: "5030", name: "Cost of Services — Crew", type: "Expense", balance: 2400 },
@@ -6918,6 +6970,7 @@ const FinanceView = ({ activeEntity, allOps }) => {
       </div>}
 
       <InfoStrip type="info"><strong>Data source:</strong> {totals.count} invoices, {activeSvcMix.reduce((a, s) => a + s.lines, 0)} line items across {filtEnts.length} entities. Period: {dateFrom} to {dateTo}. All amounts at invoice-level precision.</InfoStrip>
+      <InfoStrip type="gold"><strong>Revenue basis (audit B01 — pending finance sign-off):</strong> gross billings above include pass-through disbursements (canal dues, port &amp; government fees) which are client money, not income. Live ERP split: <strong>net agency income ${live.gl.netAgencyIncome.toLocaleString()}</strong> (fee/commission lines) vs <strong>${live.gl.passThroughBilled.toLocaleString()} pass-through</strong> (held as "Advances from Principals", acct 2040). Line classification defaults by service name and can be overridden per line. <strong>The FDA is the authoritative invoice</strong> — its status and payment state are the single source of truth (audit B12).</InfoStrip>
     </>}
 
     {tab === "bs" && <>
@@ -6975,6 +7028,7 @@ const FinanceView = ({ activeEntity, allOps }) => {
             </table>
           </div>
           <InfoStrip type="info"><strong>SAP company code model:</strong> Each entity maintains its own ledger. Intercompany accounts (7xxx) net to zero on consolidation. Shared chart of accounts across all three entities.</InfoStrip>
+          <InfoStrip type="gold"><strong>FX consolidation policy (audit B10 — pending finance sign-off):</strong> monetary balance-sheet items translate at the <strong>closing rate</strong>; P&amp;L at the <strong>period-average rate</strong>. Translation residual posts to CTA (acct 3030, equity); realised differences post to FX Gain/(Loss) (acct 4910).</InfoStrip>
         </>;
       })()}
     </>}
@@ -7077,7 +7131,8 @@ const TariffView = () => {
   const removeSlab = idx => setSlabs(p => p.filter((_, i) => i !== idx));
 
   const inp = { border: `1px solid ${S.border}`, borderRadius: 4, padding: "4px 8px", fontSize: 12, textAlign: "right", background: S.surface, width: 80 };
-  const examples = [{ label: "300 SCNT", scnt: 300 }, { label: "880 SCNT (BELLA VITA)", scnt: 880 }, { label: "2,940 SCNT (SERENITY STAR)", scnt: 2940 }];
+  // Includes cross-boundary profiles (audit B08/B19): 7,500 spans slabs 1–2; 24,000 spans slabs 1–4.
+  const examples = [{ label: "300 SCNT", scnt: 300 }, { label: "880 SCNT (BELLA VITA)", scnt: 880 }, { label: "2,940 SCNT (SERENITY STAR)", scnt: 2940 }, { label: "7,500 SCNT — crosses the 5,000 boundary", scnt: 7500 }, { label: "24,000 SCNT — crosses three boundaries", scnt: 24000 }];
 
   return <>
     <div style={{ display: "flex", gap: 0, borderBottom: `1px solid ${S.border}`, marginBottom: 12 }}>
@@ -7092,7 +7147,7 @@ const TariffView = () => {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
           <div>
             <div style={{ fontSize: 14, fontWeight: 500, color: S.navy }}>SCA Transit Dues — Special Floating Units toll table</div>
-            <div style={{ fontSize: 11, color: S.textS, marginTop: 4, lineHeight: 1.5 }}>Slab-based tariff for vessels 300 SCNT and above. Rates in SDR per ton. Effective 15 January 2024.<br />Each slab is charged at its own rate — like tax brackets. The rate per ton decreases as tonnage increases.</div>
+            <div style={{ fontSize: 11, color: S.textS, marginTop: 4, lineHeight: 1.5 }}>Slab-based tariff for vessels 300 SCNT and above. Rates in SDR per ton. Effective 15 January 2024.<br /><strong>Marginal (progressive) calculation</strong> — each slab is charged at its own rate, like tax brackets; only the tons falling <em>inside</em> a slab pay that slab's rate. The basis is <strong>Suez Canal Net Tonnage (SCNT)</strong> — never SCGT or GT (resolver falls back SCNT → SCGT → GT only when SCNT is missing, flagged on the vessel).</div>
           </div>
           <div style={{ padding: "10px 14px", borderRadius: 6, background: S.blueBg, flexShrink: 0, minWidth: 220 }}>
             <div style={{ fontSize: 10, color: S.textS, fontWeight: 500 }}>CURRENT SDR RATE</div>
@@ -7232,11 +7287,12 @@ const TariffView = () => {
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
         {/* SC Transit Rates */}
         <div style={{ background: S.surface, border: `1px solid ${S.border}`, borderRadius: 8, padding: 16 }}>
-          <div style={{ fontSize: 12, fontWeight: 500, color: S.navy, textTransform: "uppercase", marginBottom: 10 }}>SC transit rates (per ton, LOA-based for &lt; 300 GT)</div>
+          <div style={{ fontSize: 12, fontWeight: 500, color: S.navy, textTransform: "uppercase", marginBottom: 10 }}>SC transit rates (USD per ton) — documented exception</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             <div><div style={{ fontSize: 10, color: S.textS, marginBottom: 2 }}>Foreign vessel (USD/ton)</div><input type="number" step="0.01" value={scRates.foreign} onChange={e => setScRates(p => ({ ...p, foreign: parseFloat(e.target.value) || 0 }))} style={{ width: "100%", ...inp, textAlign: "left" }} /></div>
             <div><div style={{ fontSize: 10, color: S.textS, marginBottom: 2 }}>Egyptian vessel (USD/ton)</div><input type="number" step="0.01" value={scRates.egyptian} onChange={e => setScRates(p => ({ ...p, egyptian: parseFloat(e.target.value) || 0 }))} style={{ width: "100%", ...inp, textAlign: "left" }} /></div>
           </div>
+          <div style={{ fontSize: 10, color: S.textS, marginTop: 8, lineHeight: 1.5, background: S.goldBg, borderRadius: 4, padding: "6px 8px" }}><strong>Scope (audit B09):</strong> NOT used for &lt;300&nbsp;T canal dues. The authoritative small-vessel method is the SCA formula above — SCNT = (L×W×D)/2.82, dues = SCNT × 5 × SDR. This USD/ton card is kept only for the specific SCA cases that bill per ton.</div>
         </div>
         {/* Mooring & Lights */}
         <div style={{ background: S.surface, border: `1px solid ${S.border}`, borderRadius: 8, padding: 16 }}>
@@ -7339,12 +7395,13 @@ const AccessView = () => {
   const [adding, setAdding] = useState(false);
   const [nu, setNu] = useState({ name: "", role: "Operations Manager", entity: "FMA", office: "HQ" });
   const ROLE_DEFS = [
-    { id: "r1", name: "Administrator", desc: "Full system access — all modules, all entities, all actions", level: "Full", color: S.red },
-    { id: "r2", name: "Product Manager", desc: "Full access — product strategy, all modules, all entities, system configuration", level: "Full", color: S.navy },
-    { id: "r3", name: "Operations Manager", desc: "Operations, PDA/FDA, transit, crew, finance read-only", level: "Write", color: S.brand },
-    { id: "r4", name: "Operation Specialist", desc: "Day-to-day operations, PDA/FDA, transit, crew, visa — no finance config", level: "Write", color: S.blue },
+    // Full = create/edit + delete + configuration. Write = create/edit only (no delete, no config). Audit B07/OQ6.
+    { id: "r1", name: "Administrator", desc: "Full system access — all modules, all entities, all actions incl. delete, configuration and Access Control", level: "Full", color: S.red },
+    { id: "r2", name: "Product Manager", desc: "Full access to all business modules (incl. delete/config) — Access Control itself is Administrator-only", level: "Full", color: S.navy },
+    { id: "r3", name: "Operations Manager", desc: "Operations, PDA/FDA, transit, crew (create/edit + delete); finance read-only", level: "Write", color: S.brand },
+    { id: "r4", name: "Operation Specialist", desc: "Day-to-day operations, PDA/FDA, transit, crew, visa (create/edit, no delete/config) — no finance config", level: "Write", color: S.blue },
     { id: "r5", name: "Finance Manager", desc: "Full finance access, read-only operations", level: "Write", color: S.green },
-    { id: "r6", name: "Field Operator", desc: "Service log, visa stamps, crew changes — no finance", level: "Limited", color: S.orange },
+    { id: "r6", name: "Field Operator", desc: "Service log (write), visa stamps, crew changes — no finance", level: "Limited", color: S.orange },
     { id: "r7", name: "Ismailia Office", desc: "Transit ETA/ETD entry only — all other fields dimmed", level: "Restricted", color: S.purple },
     { id: "r8", name: "View Only", desc: "Read-only access — no create, edit, or delete", level: "Read", color: S.textH },
   ];
@@ -7367,6 +7424,8 @@ const AccessView = () => {
   const [matrix, setMatrix] = useState([
     { module: "Dashboard", admin: "Full", prodMgr: "Full", opsMgr: "Read", opSpec: "Read", finMgr: "Read", fieldOp: "Read", ismailia: "None", viewOnly: "Read" },
     { module: "Operations", admin: "Full", prodMgr: "Full", opsMgr: "Full", opSpec: "Full", finMgr: "Read", fieldOp: "Read", ismailia: "None", viewOnly: "Read" },
+    // Field Operators write the on-the-ground service log even though the rest of Operations is read-only for them (audit B07).
+    { module: "Service Log", admin: "Full", prodMgr: "Full", opsMgr: "Full", opSpec: "Write", finMgr: "Read", fieldOp: "Write", ismailia: "None", viewOnly: "Read" },
     { module: "PDA / FDA", admin: "Full", prodMgr: "Full", opsMgr: "Full", opSpec: "Full", finMgr: "Read", fieldOp: "None", ismailia: "None", viewOnly: "Read" },
     { module: "Transit", admin: "Full", prodMgr: "Full", opsMgr: "Full", opSpec: "Full", finMgr: "Read", fieldOp: "Read", ismailia: "Write", viewOnly: "Read" },
     { module: "Crew Change", admin: "Full", prodMgr: "Full", opsMgr: "Full", opSpec: "Write", finMgr: "None", fieldOp: "Write", ismailia: "None", viewOnly: "Read" },
@@ -7375,7 +7434,8 @@ const AccessView = () => {
     { module: "Finance", admin: "Full", prodMgr: "Full", opsMgr: "Read", opSpec: "Read", finMgr: "Full", fieldOp: "None", ismailia: "None", viewOnly: "Read" },
     { module: "Yacht Directory", admin: "Full", prodMgr: "Full", opsMgr: "Write", opSpec: "Write", finMgr: "Read", fieldOp: "Read", ismailia: "None", viewOnly: "Read" },
     { module: "Tariffs", admin: "Full", prodMgr: "Full", opsMgr: "Read", opSpec: "Read", finMgr: "Full", fieldOp: "None", ismailia: "None", viewOnly: "Read" },
-    { module: "Access Control", admin: "Full", prodMgr: "Full", opsMgr: "None", opSpec: "None", finMgr: "None", fieldOp: "None", ismailia: "None", viewOnly: "None" },
+    // Access Control is Administrator-only (audit B07): PM keeps full business access but cannot grant/revoke permissions.
+    { module: "Access Control", admin: "Full", prodMgr: "None", opsMgr: "None", opSpec: "None", finMgr: "None", fieldOp: "None", ismailia: "None", viewOnly: "None" },
   ]);
   const updUser = (id, field, val) => setUsers(p => p.map(u => u.id === id ? { ...u, [field]: val } : u));
   const addUser = () => { if (!nu.name) return; setUsers(p => [...p, { id: `u${Date.now()}`, ...nu, lastLogin: "—", active: true }]); setNu({ name: "", role: "Operations Manager", entity: "FMA", office: "HQ" }); setAdding(false); };
@@ -7810,7 +7870,7 @@ function FelixIQ({ currentUser, onSignOut }) {
 
         {/* Footer */}
         <div style={{ borderTop: `1px solid ${S.border}`, padding: "8px 18px", display: "flex", justifyContent: "space-between", fontSize: 10, color: S.textH }}>
-          <span>Felix iQ · FMA-DEV-SPEC-2026-002 v2.0 · {MODULES.length} modules · 30 database tables · 80+ services</span>
+          <span>Felix iQ · FMA-DEV-SPEC-2026-002 v2.0 · {MODULES.length} modules · 30 database tables · 80+ catalogued services</span>
           <span>Palace Tower 1, Palestine & El Salam St, Port Said · Est. 1983</span>
         </div>
       </div>
