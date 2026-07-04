@@ -830,11 +830,24 @@ const VoyageKpi = ({ label, value, accent, bar }) => (
 );
 const VoyageCostRow = ({ k, v }) => <div style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", fontSize: 13 }}><span style={{ color: S.textS }}>{k}</span><span>${v.toLocaleString()}</span></div>;
 
-function VoyagePortPicker({ onPick, onCancel }) {
+function VoyagePortPicker({ onPick, onCancel, withVirtual }) {
   const cats = ["Mediterranean", "Suez Canal Zone", "Red Sea (Northern)", "Red Sea (Central & Southern)", "Gulf of Aqaba"];
   return (
     <div style={{ background: S.surface, border: `1px solid ${S.border}`, borderRadius: 8, padding: 14, marginTop: 10, textAlign: "left" }}>
       <div style={{ fontSize: 11, fontWeight: 500, color: S.textS, textTransform: "uppercase", letterSpacing: ".04em", marginBottom: 8 }}>Select port from Egyptian port library</div>
+      {withVirtual && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 10, color: S.textH, marginBottom: 4 }}>Canal transit &amp; cruising areas</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {Object.values(VIRTUAL_PORTS).map(p => (
+              <button key={p.code} onClick={() => onPick(p.code)}
+                style={{ padding: "4px 10px", borderRadius: 4, fontSize: 11, cursor: "pointer", border: `1px solid ${S.border}`, background: S.cyanBg, color: S.cyan, display: "flex", alignItems: "center", gap: 4 }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor = S.cyan; }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = S.border; }}><Waves size={11} /> {p.name}</button>
+            ))}
+          </div>
+        </div>
+      )}
       {cats.map(cat => {
         const list = PORTS_EG.filter(p => p.cat === cat);
         if (!list.length) return null;
@@ -926,6 +939,166 @@ function VoyageLegCard({ leg, seq, sel, onSel, onSetField, onToggle, onRemove, o
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ---- Journey timeline (client-journey map) ----------------------------------
+// The voyage rendered as a horizontal timeline: phase bands on top (grouped by
+// region), a numbered node per stop, and each stop's services popping out
+// beneath it. Clicking a service opens a detail panel; stops and services can
+// be added directly on the timeline. Reuses the same `plan` legs as the
+// itinerary, so everything stays linked to the operation & vessel and persists.
+function JourneyTimeline({ op, plan, sel, onSelStop, svcSel, onSelSvc, onToggleSvc, onSetSvcField, onRemoveSvc, onAddSvc, onInsertStop, onRemoveLeg }) {
+  const [svcMenu, setSvcMenu] = useState(null);   // leg.id with the +service menu open
+  const [addingAt, setAddingAt] = useState(null); // index to insert a stop at
+
+  const phases = [];
+  plan.forEach(l => {
+    const label = l.region || "En route";
+    const last = phases[phases.length - 1];
+    if (last && last.label === label) last.count++;
+    else phases.push({ label, count: 1 });
+  });
+
+  const isVirtual = (code) => !!VIRTUAL_PORTS[code];
+  const selLeg = svcSel ? plan.find(l => l.id === svcSel.legId) : null;
+  const selSvc = selLeg ? selLeg.services.find(s => s.key === svcSel.key) : null;
+  const selMeta = selSvc ? (VOYAGE_SVC[selSvc.key] || { label: selSvc.key }) : null;
+
+  const chev = "polygon(0 0, calc(100% - 10px) 0, 100% 50%, calc(100% - 10px) 100%, 0 100%)";
+  const insertBtn = (idx) => (
+    <div style={{ width: 18, display: "flex", flexDirection: "column", alignItems: "center", flexShrink: 0 }}>
+      <button title="Insert a stop here" onClick={() => { setAddingAt(idx); setSvcMenu(null); }}
+        style={{ width: 18, height: 18, marginTop: 7, borderRadius: "50%", border: `1px dashed ${S.textH}`, background: S.surface, color: S.textS, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0, zIndex: 1 }}
+        onMouseEnter={e => { e.currentTarget.style.borderColor = S.brand; e.currentTarget.style.color = S.brand; }}
+        onMouseLeave={e => { e.currentTarget.style.borderColor = S.textH; e.currentTarget.style.color = S.textS; }}><Plus size={11} /></button>
+    </div>
+  );
+
+  return (
+    <div style={{ background: S.surface, border: `1px solid ${S.border}`, borderRadius: 8, marginBottom: 14, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 16px", borderBottom: `1px solid ${S.borderL}`, flexWrap: "wrap" }}>
+        <Waves size={15} style={{ color: S.brand }} />
+        <span style={{ fontSize: 13, fontWeight: 600, color: S.navy }}>Journey timeline</span>
+        <span style={{ fontSize: 11, color: S.textS, background: S.bg, padding: "1px 8px", borderRadius: 10 }}>{op.vesselName}</span>
+        <span style={{ fontSize: 11, color: S.textS, background: S.bg, padding: "1px 8px", borderRadius: 10 }}>{op.opNumber}</span>
+        <span style={{ flex: 1 }} />
+        <span style={{ fontSize: 10, color: S.textH }}>click a stop or service for details · use + to add along the route</span>
+      </div>
+
+      <div style={{ overflowX: "auto", padding: "14px 16px 16px" }}>
+        <div style={{ minWidth: Math.max(plan.length * 150 + 120, 560) }}>
+          {/* phase bands */}
+          <div style={{ display: "flex", gap: 3, marginBottom: 16, paddingRight: 100 }}>
+            {phases.map((ph, i) => (
+              <div key={i} style={{ flex: ph.count, minWidth: 0, background: S.navy, color: "#fff", fontSize: 11, fontWeight: 700, letterSpacing: ".02em", padding: "5px 18px 5px 12px", clipPath: chev, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ph.label}</div>
+            ))}
+          </div>
+
+          {/* nodes + services */}
+          <div style={{ position: "relative", display: "flex", alignItems: "flex-start" }}>
+            <div style={{ position: "absolute", left: 0, right: 0, top: 15, height: 2, background: S.line }} />
+            {plan.map((l, i) => {
+              const on = sel === l.id;
+              const virt = isVirtual(l.code);
+              return (
+                <Fragment key={l.id}>
+                  {i > 0 && insertBtn(i)}
+                  <div style={{ flex: 1, minWidth: 132, display: "flex", flexDirection: "column", alignItems: "center", padding: "0 4px" }}>
+                    <button onClick={() => onSelStop(on ? null : l.id)} title={virt ? l.name : `${l.name} — open in itinerary`}
+                      style={{ width: 32, height: 32, borderRadius: "50%", border: "2px solid #fff", boxShadow: `0 0 0 ${on ? 2 : 1}px ${on ? S.brand : S.border}`, background: on ? S.brand : virt ? S.cyan : S.navy, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1, flexShrink: 0 }}>
+                      {virt ? <Waves size={14} /> : i + 1}
+                    </button>
+                    <div style={{ fontSize: 11, fontWeight: on ? 600 : 500, color: on ? S.brand : S.text, marginTop: 6, textAlign: "center", lineHeight: 1.3, maxWidth: 140 }}>{l.name}</div>
+                    <div style={{ fontSize: 9.5, color: S.textS, marginTop: 1, textAlign: "center" }}>{l.arrive || "ETA —"}{l.depart ? ` → ${l.depart}` : ""}</div>
+                    {/* connector down to services */}
+                    {(l.services.length > 0) && <div style={{ width: 0, height: 8, borderLeft: `1px dashed ${S.textH}`, marginTop: 4 }} />}
+                    <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 4, alignItems: "stretch", width: "100%", maxWidth: 148 }}>
+                      {l.services.map(s => {
+                        const m = VOYAGE_SVC[s.key] || { label: s.key };
+                        const active = svcSel && svcSel.legId === l.id && svcSel.key === s.key;
+                        return (
+                          <button key={s.key} onClick={() => onSelSvc(active ? null : { legId: l.id, key: s.key })}
+                            style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 8px", borderRadius: 10, fontSize: 10, fontWeight: 500, cursor: "pointer", border: `1px solid ${active ? S.brand : s.arranged ? "#BFE3CC" : S.border}`, background: active ? S.brandL : s.arranged ? S.greenBg : S.surface, color: s.arranged ? S.green : S.textS, textAlign: "left" }}>
+                            {s.arranged ? <Check size={10} style={{ flexShrink: 0 }} /> : <CircleDot size={9} style={{ flexShrink: 0 }} />}
+                            <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{m.label}</span>
+                          </button>
+                        );
+                      })}
+                      <div style={{ position: "relative" }}>
+                        <button onClick={() => { setSvcMenu(svcMenu === l.id ? null : l.id); }}
+                          style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 3, padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 500, cursor: "pointer", border: `1px dashed ${S.border}`, background: "transparent", color: S.textH }}
+                          onMouseEnter={e => { e.currentTarget.style.color = S.brand; e.currentTarget.style.borderColor = S.brand; }}
+                          onMouseLeave={e => { e.currentTarget.style.color = S.textH; e.currentTarget.style.borderColor = S.border; }}><Plus size={9} /> service</button>
+                        {svcMenu === l.id && (
+                          <div style={{ position: "absolute", left: "50%", transform: "translateX(-50%)", top: "100%", marginTop: 4, zIndex: 30, background: S.surface, border: `1px solid ${S.border}`, borderRadius: 6, boxShadow: "0 8px 24px rgba(0,0,0,.14)", minWidth: 185 }}>
+                            {VOYAGE_SVC_KEYS.filter(k => !l.services.some(s => s.key === k)).map(k => (
+                              <div key={k} onClick={() => { onAddSvc(l.id, k); setSvcMenu(null); onSelSvc({ legId: l.id, key: k }); }}
+                                style={{ padding: "6px 12px", fontSize: 11, cursor: "pointer", color: S.text }}
+                                onMouseEnter={e => e.currentTarget.style.background = S.bg} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>{VOYAGE_SVC[k].label}</div>
+                            ))}
+                            {VOYAGE_SVC_KEYS.every(k => l.services.some(s => s.key === k)) && <div style={{ padding: "6px 12px", fontSize: 11, color: S.textH }}>All services added</div>}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </Fragment>
+              );
+            })}
+            {/* add stop at the end */}
+            {insertBtn(plan.length)}
+            <div style={{ width: 96, display: "flex", flexDirection: "column", alignItems: "center", flexShrink: 0 }}>
+              <button onClick={() => setAddingAt(plan.length)}
+                style={{ width: 32, height: 32, borderRadius: "50%", border: `2px dashed ${S.textH}`, background: S.surface, color: S.textS, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1 }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor = S.brand; e.currentTarget.style.color = S.brand; }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = S.textH; e.currentTarget.style.color = S.textS; }}><Plus size={15} /></button>
+              <div style={{ fontSize: 10, color: S.textH, marginTop: 6 }}>Add stop</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* service detail panel */}
+      {selLeg && selSvc && (
+        <div style={{ borderTop: `1px solid ${S.borderL}`, background: S.bg, padding: "12px 16px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: S.navy }}>{selMeta.label}</span>
+            <span style={{ fontSize: 10.5, fontWeight: 500, padding: "2px 8px", borderRadius: 10, background: selSvc.arranged ? S.greenBg : S.goldBg, color: selSvc.arranged ? S.green : S.gold }}>{selSvc.arranged ? "Arranged" : "Pending"}</span>
+            <span style={{ fontSize: 11, color: S.textS, background: S.surface, border: `1px solid ${S.borderL}`, padding: "1px 8px", borderRadius: 10, display: "flex", alignItems: "center", gap: 4 }}><MapPin size={10} /> {selLeg.name}</span>
+            <span style={{ fontSize: 11, color: S.textS, background: S.surface, border: `1px solid ${S.borderL}`, padding: "1px 8px", borderRadius: 10, display: "flex", alignItems: "center", gap: 4 }}><Ship size={10} /> {op.vesselName}</span>
+            <span style={{ fontSize: 11, color: S.textS, background: S.surface, border: `1px solid ${S.borderL}`, padding: "1px 8px", borderRadius: 10, display: "flex", alignItems: "center", gap: 4 }}><ClipboardList size={10} /> {op.opNumber}</span>
+            <span style={{ flex: 1 }} />
+            <button onClick={() => onSelSvc(null)} style={{ border: "none", background: "none", cursor: "pointer", color: S.textH, padding: 2 }}><X size={15} /></button>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div>
+              <div style={{ fontSize: 10, color: S.textS, marginBottom: 2 }}>Estimate (USD)</div>
+              <input type="number" value={selSvc.est ?? ""} onChange={e => onSetSvcField(selLeg.id, selSvc.key, "est", Number(e.target.value) || 0)}
+                style={{ width: 110, border: `1px solid ${S.border}`, borderRadius: 3, padding: "5px 7px", fontSize: 12, boxSizing: "border-box" }} />
+            </div>
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <div style={{ fontSize: 10, color: S.textS, marginBottom: 2 }}>Notes (supplier, reference, timing…)</div>
+              <input value={selSvc.note || ""} placeholder="e.g. 2 crew embarking at Suez — visas via batch V-104" onChange={e => onSetSvcField(selLeg.id, selSvc.key, "note", e.target.value)}
+                style={{ width: "100%", border: `1px solid ${S.border}`, borderRadius: 3, padding: "5px 7px", fontSize: 12, boxSizing: "border-box" }} />
+            </div>
+            <button onClick={() => onToggleSvc(selLeg.id, selSvc.key)}
+              style={{ display: "flex", alignItems: "center", gap: 4, padding: "6px 12px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: "pointer", border: "none", background: selSvc.arranged ? S.bg : S.green, color: selSvc.arranged ? S.textS : "#fff" }}>
+              {selSvc.arranged ? "Mark pending" : <><Check size={12} /> Mark arranged</>}
+            </button>
+            <button onClick={() => { onRemoveSvc(selLeg.id, selSvc.key); onSelSvc(null); }}
+              style={{ display: "flex", alignItems: "center", gap: 4, padding: "6px 12px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: "pointer", border: `1px solid ${S.border}`, background: "transparent", color: S.red }}><Trash2 size={12} /> Remove</button>
+          </div>
+        </div>
+      )}
+
+      {/* stop picker for timeline insertion */}
+      {addingAt != null && (
+        <div style={{ borderTop: `1px solid ${S.borderL}`, padding: "0 16px 14px" }}>
+          <VoyagePortPicker withVirtual onPick={(code) => { onInsertStop(code, addingAt); setAddingAt(null); }} onCancel={() => setAddingAt(null)} />
+        </div>
+      )}
     </div>
   );
 }
@@ -1027,6 +1200,7 @@ function VoyageRouteChart({ ports, sel, onPick, vessel }) {
 function VoyageTab({ op, plan, setPlan }) {
   const [sel, setSel] = useState(null);
   const [adding, setAdding] = useState(false);
+  const [svcSel, setSvcSel] = useState(null); // {legId, key} — service open in the journey-timeline detail panel
   // The itinerary auto-builds from the operation's ports of call, so the Voyage tab
   // reflects the op without a manual pre-fill step. Seeds once per op — deliberately
   // cleared plans are not re-seeded within the session.
@@ -1038,11 +1212,12 @@ function VoyageTab({ op, plan, setPlan }) {
     return { sub, fee: Math.round(sub * 0.1), grand: Math.round(sub * 1.1), done, total, pct: total ? Math.round(done / total * 100) : 0 };
   }, [plan]);
 
-  const addPort = (code) => {
+  const addPort = (code, at = null) => {
     const p = portByCode(code); if (!p) return;
     const id = code + "_" + Date.now();
-    setPlan(ls => [...ls, { id, code, name: p.name, region: p.cat, lat: p.lat, lng: p.lng, arrive: "", depart: "", status: "Planned",
-      services: [{ key: "clearance", est: VOYAGE_SVC.clearance.est, arranged: false }, { key: "berth", est: VOYAGE_SVC.berth.est, arranged: false }] }]);
+    const leg = { id, code, name: p.name, region: p.cat, lat: p.lat, lng: p.lng, arrive: "", depart: "", status: "Planned",
+      services: [{ key: "clearance", est: VOYAGE_SVC.clearance.est, arranged: false }, { key: "berth", est: VOYAGE_SVC.berth.est, arranged: false }] };
+    setPlan(ls => { const n = [...ls]; n.splice(at == null ? n.length : Math.min(at, n.length), 0, leg); return n; });
     setSel(id); setAdding(false);
   };
   const seedFromPorts = () => {
@@ -1059,8 +1234,9 @@ function VoyageTab({ op, plan, setPlan }) {
       seedFromPorts();
     }
   }, [op.id, plan.length]);
-  const removeLeg = (id) => { setPlan(ls => ls.filter(l => l.id !== id)); if (sel === id) setSel(null); };
+  const removeLeg = (id) => { setPlan(ls => ls.filter(l => l.id !== id)); if (sel === id) setSel(null); if (svcSel?.legId === id) setSvcSel(null); };
   const setField = (lid, field, v) => setPlan(ls => ls.map(l => l.id === lid ? { ...l, [field]: v } : l));
+  const setSvcField = (lid, key, field, v) => setPlan(ls => ls.map(l => l.id === lid ? { ...l, services: l.services.map(s => s.key === key ? { ...s, [field]: v } : s) } : l));
   const toggleSvc = (lid, key) => setPlan(ls => ls.map(l => l.id === lid ? { ...l, services: l.services.map(s => s.key === key ? { ...s, arranged: !s.arranged } : s) } : l));
   const removeSvc = (lid, key) => setPlan(ls => ls.map(l => l.id === lid ? { ...l, services: l.services.filter(s => s.key !== key) } : l));
   const addSvc = (lid, key) => setPlan(ls => ls.map(l => l.id === lid ? { ...l, services: [...l.services, { key, est: VOYAGE_SVC[key].est, arranged: false }] } : l));
@@ -1097,6 +1273,10 @@ function VoyageTab({ op, plan, setPlan }) {
           <button onClick={() => { if (confirm("Clear this voyage plan?")) setPlan([]); }} style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 12px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: "pointer", border: `1px solid ${S.border}`, background: "transparent", color: S.textS }}>Clear plan</button>
         </div>
       </div>
+
+      <JourneyTimeline op={op} plan={plan} sel={sel} onSelStop={setSel}
+        svcSel={svcSel} onSelSvc={setSvcSel} onToggleSvc={toggleSvc} onSetSvcField={setSvcField}
+        onRemoveSvc={removeSvc} onAddSvc={addSvc} onInsertStop={addPort} onRemoveLeg={removeLeg} />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 14 }}>
         <VoyageKpi label="Port calls" value={plan.length} />
