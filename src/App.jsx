@@ -511,6 +511,14 @@ const TRANSITS = [
 // derive yet (G&A expenses — until supplier bills/cash ledger modules exist).
 const FIN_BASELINE = { gaExpenses: 3200 };
 const ENTITY_CODE = { "Felix Maritime Agency": "FMA", "German Agency": "GRA", "Cruising Agency": "CRA" };
+
+// ---- Operation team (2-3 people often share one yacht) ------------------------
+// op.team = [{ staffId, role }] with the Lead first; op.staffId stays synced to
+// the Lead so every existing staffId read keeps working.
+const OP_TEAM_ROLES = ["Lead", "Support", "Finance", "Field"];
+const opTeam = (op) => (op?.team && op.team.length ? op.team : (op?.staffId ? [{ staffId: op.staffId, role: "Lead" }] : []));
+const onTeam = (op, uid) => !!uid && opTeam(op).some(m => m.staffId === uid);
+const teamMembers = (op) => opTeam(op).map(m => ({ ...m, name: STAFF.find(s => s.id === m.staffId)?.name || m.staffId }));
 const fdaDocTotal = (d) => (d.items || []).reduce((s, i) => s + (Number(i.actualAmount != null ? i.actualAmount : (Number(i.qty) || 0) * (Number(i.price) || 0)) || 0), 0);
 const fdaDocVat = (d) => (d.items || []).reduce((s, i) => s + ((Number(i.qty) || 0) * (Number(i.price) || 0) * (Number(i.vat) || 0) / 100), 0);
 // Pass-through vs agency-fee classification (audit B01, pending Finance sign-off).
@@ -612,6 +620,49 @@ function parseEmailEnquiry(raw) {
   if (/visa/i.test(t)) out.services.push("Visas");
   if (/spare|parts|technical/i.test(t)) out.services.push("Spare parts");
   return out;
+}
+
+// Inline team editor shown in the operation header: chips per member (Lead
+// first), click a chip to cycle its role, × to remove, + to add a colleague.
+function OpTeamChips({ op, patchOp }) {
+  const [adding, setAdding] = useState(false);
+  const team = teamMembers(op);
+  const commit = (next) => {
+    const lead = next.find(m => m.role === "Lead") || next[0];
+    patchOp({ team: next.map(({ staffId, role }) => ({ staffId, role })), staffId: lead ? lead.staffId : null });
+  };
+  const cycleRole = (idx) => {
+    const next = team.map((m, i) => i === idx ? { ...m, role: OP_TEAM_ROLES[(OP_TEAM_ROLES.indexOf(m.role) + 1) % OP_TEAM_ROLES.length] } : m);
+    if (!next.some(m => m.role === "Lead")) next[idx] = { ...next[idx], role: "Lead" }; // never leadless
+    commit(next);
+  };
+  const remove = (idx) => { if (team.length <= 1) return; commit(team.filter((_, i) => i !== idx)); };
+  const avail = STAFF.filter(s => !team.some(m => m.staffId === s.id));
+  return (
+    <span style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
+      {team.map((m, i) => (
+        <span key={m.staffId} title={`${m.name} — ${m.role}. Click to change role${team.length > 1 ? ", × to remove" : ""}.`}
+          style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "1px 7px", borderRadius: 10, fontSize: 11, fontWeight: 500, cursor: "pointer", background: m.role === "Lead" ? S.brandL : S.bg, color: m.role === "Lead" ? S.brand : S.textS, border: `1px solid ${m.role === "Lead" ? S.line : S.borderL}` }}
+          onClick={() => cycleRole(i)}>
+          {m.role === "Lead" && "★ "}{m.name.split(" ")[0]}<span style={{ fontSize: 9, opacity: .75 }}>· {m.role}</span>
+          {team.length > 1 && <X size={10} style={{ marginLeft: 1 }} onClick={ev => { ev.stopPropagation(); remove(i); }} />}
+        </span>
+      ))}
+      <span style={{ position: "relative" }}>
+        <button onClick={() => setAdding(!adding)} title="Add a team member" style={{ width: 18, height: 18, borderRadius: "50%", border: `1px dashed ${S.textH}`, background: "transparent", color: S.textS, cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", padding: 0 }}><Plus size={10} /></button>
+        {adding && (
+          <span style={{ position: "absolute", left: 0, top: "100%", marginTop: 4, zIndex: 30, background: S.surface, border: `1px solid ${S.border}`, borderRadius: 6, boxShadow: "0 8px 24px rgba(0,0,0,.14)", minWidth: 180, display: "block" }}>
+            {avail.length === 0 && <span style={{ display: "block", padding: "6px 12px", fontSize: 11, color: S.textH }}>Everyone's on it</span>}
+            {avail.map(s => (
+              <span key={s.id} onClick={() => { commit([...team, { staffId: s.id, role: "Support", name: s.name }]); setAdding(false); }}
+                style={{ display: "block", padding: "6px 12px", fontSize: 12, cursor: "pointer", color: S.text }}
+                onMouseEnter={e => e.currentTarget.style.background = S.bg} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>{s.name}</span>
+            ))}
+          </span>
+        )}
+      </span>
+    </span>
+  );
 }
 
 // Correspondence tab on the operation: linked emails with lifecycle stages.
@@ -2702,7 +2753,7 @@ function SmallVesselCanalCalc({ sdr }) {
     </div>
   </div>;
 }
-const DashboardView = ({ setMod, onCreateOp, allOps }) => {
+const DashboardView = ({ setMod, onCreateOp, allOps, user, openMyOps }) => {
   const ops = allOps || OPERATIONS;
   const active = ops.filter(o => o.status === "Active" || o.status === "Upcoming");
   const critAlerts = ALERTS.filter(a => a.type === "critical");
@@ -2735,7 +2786,7 @@ const DashboardView = ({ setMod, onCreateOp, allOps }) => {
   return <>
     {/* Greeting + date */}
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-      <div style={{ fontSize: 15, fontWeight: 500 }}>{new Date().getHours() < 12 ? "Good morning" : new Date().getHours() < 17 ? "Good afternoon" : "Good evening"}, Sarah</div>
+      <div style={{ fontSize: 15, fontWeight: 500 }}>{new Date().getHours() < 12 ? "Good morning" : new Date().getHours() < 17 ? "Good afternoon" : "Good evening"}, {(user?.name || "there").split(" ")[0]}</div>
       <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
         <button onClick={() => onCreateOp && onCreateOp()} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 14px", borderRadius: 4, fontSize: 12, fontWeight: 500, cursor: "pointer", border: `1px solid ${S.orange}`, background: S.orange, color: "#fff" }}><Plus size={14} /> Create New Operation</button>
         <div style={{ fontSize: 11, color: S.textS }}><Calendar size={11} style={{ marginRight: 3 }} />{new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" })} · Port Said</div>
@@ -2816,6 +2867,33 @@ const DashboardView = ({ setMod, onCreateOp, allOps }) => {
         })}
       </div>
     </div>
+
+    {/* My operations — the ops where the signed-in user is on the team */}
+    {(() => {
+      const mine = ops.filter(o => onTeam(o, user?.id) && ["Enquiry", "Upcoming", "Active"].includes(o.status));
+      return <div style={{ background: S.surface, border: `1px solid ${S.border}`, borderRadius: 8, overflow: "hidden", marginBottom: 10 }}>
+        <div style={{ padding: "8px 14px", borderBottom: `1px solid ${S.borderL}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 13, fontWeight: 500 }}><UserCircle size={13} style={{ marginRight: 4 }} />My operations <span style={{ fontSize: 11, color: S.textS, fontWeight: 400 }}>— you're on the team of {mine.length} live op{mine.length === 1 ? "" : "s"}</span></span>
+          <button onClick={openMyOps} style={{ fontSize: 11, color: S.brand, background: "none", border: "none", cursor: "pointer" }}>Open my list</button>
+        </div>
+        {mine.length === 0 && <div style={{ padding: "14px", fontSize: 12, color: S.textS }}>Nothing assigned to you right now. When a colleague adds you to an operation's team (or you create one), it appears here.</div>}
+        {mine.slice(0, 6).map(op => {
+          const me = opTeam(op).find(m => m.staffId === user?.id);
+          const lead = teamMembers(op).find(m => m.role === "Lead");
+          const ec = entColorMap[op.entity] || { code: "FMA", color: S.blue, bg: S.blueBg };
+          return <div key={op.id} style={{ padding: "7px 14px", borderBottom: `1px solid ${S.borderL}`, display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+            <Status value={op.status} />
+            <span style={{ fontWeight: 500 }}>{op.vesselName}</span>
+            <span style={{ fontSize: 11, color: S.textS }}>{op.opNumber}</span>
+            <span style={{ fontSize: 10, padding: "1px 5px", borderRadius: 3, background: ec.bg, color: ec.color }}>{ec.code}</span>
+            <span style={{ flex: 1 }} />
+            <span style={{ fontSize: 10.5, padding: "1px 8px", borderRadius: 10, background: me?.role === "Lead" ? S.brandL : S.bg, color: me?.role === "Lead" ? S.brand : S.textS, fontWeight: 500 }}>Your role: {me?.role || "—"}</span>
+            {me?.role !== "Lead" && lead && <span style={{ fontSize: 10.5, color: S.textS }}>Lead: {lead.name.split(" ")[0]}</span>}
+            <span style={{ fontSize: 10, color: S.textS }}>ETA {op.eta || "TBC"}</span>
+          </div>;
+        })}
+      </div>;
+    })()}
 
     {/* Action feed + Quick actions sidebar */}
     <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 10 }}>
@@ -3133,9 +3211,9 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
   const sub300AddRef = useRef(null);   // registered by Sub300Builder — routes catalog "Add" clicks into the open builder
   const [editPdaItems, setEditPdaItems] = useState(null);
   const [pdaDiscount, setPdaDiscount] = useState({ desc: "", amount: 0, mode: "fixed", pct: 0 });
-  const emptyForm = { vesselName: "", yachtId: "", clientName: "", clientEmail: "", vesselLoa: "", vesselGt: "", vesselFlag: "", vesselImo: "", ports: [], eta: "", etd: "", lastPort: "", nextPort: "", baseCurrency: "USD", opType: "enquiry", staffId: "s1", notes: "", newVesselName: "", charterStatus: "Auto (from vessel)" };
+  const emptyForm = { vesselName: "", yachtId: "", clientName: "", clientEmail: "", vesselLoa: "", vesselGt: "", vesselFlag: "", vesselImo: "", ports: [], eta: "", etd: "", lastPort: "", nextPort: "", baseCurrency: "USD", opType: "enquiry", staffId: "s1", notes: "", newVesselName: "", charterStatus: "Auto (from vessel)", leadName: "", supportNames: "" };
   const [form, setForm] = useState(emptyForm);
-  useEffect(() => { if (intent === "create" || (intent && intent.create)) { setSelectedOp(null); setShowCreate(true); const yk = intent && intent.yacht; if (yk) { const ow = owners.find(o => o.id === yk.ownerId); setForm(f => ({ ...f, yachtId: yk.id, vesselName: yk.name, vesselLoa: yk.loa, vesselGt: yk.gt, vesselFlag: yk.flag, vesselImo: yk.imo || "", clientName: ow?.name || f.clientName, clientEmail: ow?.email || f.clientEmail })); } clearIntent && clearIntent(); } else if (intent && intent.openOp) { const target = (allOps || OPERATIONS).find(o => o.id === intent.openOp); if (target) { setSelectedOp(target); setActiveTab(intent.tab || "timeline"); } clearIntent && clearIntent(); } }, []);
+  useEffect(() => { if (intent === "create" || (intent && intent.create)) { setSelectedOp(null); setShowCreate(true); const yk = intent && intent.yacht; if (yk) { const ow = owners.find(o => o.id === yk.ownerId); setForm(f => ({ ...f, yachtId: yk.id, vesselName: yk.name, vesselLoa: yk.loa, vesselGt: yk.gt, vesselFlag: yk.flag, vesselImo: yk.imo || "", clientName: ow?.name || f.clientName, clientEmail: ow?.email || f.clientEmail })); } clearIntent && clearIntent(); } else if (intent && intent.openOp) { const target = (allOps || OPERATIONS).find(o => o.id === intent.openOp); if (target) { setSelectedOp(target); setActiveTab(intent.tab || "timeline"); } clearIntent && clearIntent(); } else if (intent && intent.mineOnly) { setMineOnly(true); clearIntent && clearIntent(); } }, []);
   const updateForm = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const isEnquiry = form.opType === "enquiry";
 
@@ -3220,7 +3298,15 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
       vesselFlag: form.vesselFlag || "TBC", ports: form.ports, eta: form.eta || null, etd: form.etd || null, lastPort: form.lastPort || null, nextPort: form.nextPort || null,
       // Private vs commercial-charter (audit B04): per-op override, else derived from the vessel's charterable flag. VAT rules read this, not flag alone (B13).
       charterStatus: form.charterStatus !== "Auto (from vessel)" ? form.charterStatus : (yachts.find(x => x.id === form.yachtId)?.charterable ? "Commercial charter" : "Private"),
-      baseCurrency: form.baseCurrency, staffId: user?.id || form.staffId, created: "2026-05-18", notes: form.notes,
+      baseCurrency: form.baseCurrency, staffId: (STAFF.find(s => s.name === form.leadName)?.id) || user?.id || form.staffId, created: "2026-05-18", notes: form.notes,
+      // Team (Lead + supports): several people usually share one yacht — everyone
+      // on the team sees this op under "My operations".
+      team: (() => {
+        const leadId = (STAFF.find(s => s.name === form.leadName)?.id) || user?.id || form.staffId;
+        const supports = (form.supportNames || "").split(",").map(t => t.trim()).filter(Boolean)
+          .map(n => STAFF.find(s => s.name === n)?.id).filter(id => id && id !== leadId);
+        return [{ staffId: leadId, role: "Lead" }, ...supports.map(id => ({ staffId: id, role: "Support" }))];
+      })(),
       timestamps: { enquiryReceived: new Date().toISOString(), ...(status === "Upcoming" ? { confirmed: new Date().toISOString() } : {}) },
       serviceCount: 0, pdaCount: 0, fdaCount: 0, totalRevenue: 0, totalCost: 0,
       emails: pendingEmail ? [pendingEmail] : [],   // the enquiry email that started this op, if created from one
@@ -3540,8 +3626,10 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
   const all = ["All", ...OP_STATUSES];
   const isMgmt = ["Product Manager", "Admin", "Management"].includes(user?.role);
   const officeOf = (op) => STAFF.find(s => s.id === op.staffId)?.office || "HQ";
-  const visibleOps = isMgmt ? ops : ops.filter(o => o.staffId === user?.id || officeOf(o) === user?.office);
-  const filtered = visibleOps.filter(o => filter.includes("All") || filter.includes(o.status));
+  const visibleOps = isMgmt ? ops : ops.filter(o => onTeam(o, user?.id) || officeOf(o) === user?.office);
+  const [mineOnly, setMineOnly] = useState(false);
+  const myOpsCount = visibleOps.filter(o => onTeam(o, user?.id)).length;
+  const filtered = visibleOps.filter(o => (filter.includes("All") || filter.includes(o.status)) && (!mineOnly || onTeam(o, user?.id)));
   const toggle = f => { if (f === "All") return setFilter(["All"]); const n = filter.filter(s => s !== "All"); setFilter(n.includes(f) ? (n.length === 1 ? ["All"] : n.filter(s => s !== f)) : [...n, f]); };
 
   const SERVICE_LOG = {
@@ -3643,7 +3731,7 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
                 <span style={{ color: S.textH }}>→</span>
                 <SearchSelect value={op.nextPort || ""} options={portOpts} placeholder="Next..." width={105} onChange={v => patchOp({ nextPort: v })} />
               </span>; })()],
-            ["Staff", staff?.name || "—"],
+            ["Team", <OpTeamChips key={`team_${op.id}`} op={op} patchOp={patchOp} />],
           ].map(([l, v], i) => (
             <div key={i} style={{ padding: "10px 18px", borderRight: i < 3 ? `1px solid ${S.borderL}` : "none" }}>
               <div style={{ fontSize: 11, color: S.textS, marginBottom: 2 }}>{l}</div>
@@ -4501,6 +4589,13 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
             <FW label="Client email"><input style={inp} type="email" value={form.clientEmail} onChange={e => updateForm("clientEmail", e.target.value)} placeholder="ops@hillrobinson.com" /></FW>
           </div>
 
+          {/* ── Team Section ── */}
+          <div style={{ fontSize: 12, fontWeight: 500, color: S.textS, marginBottom: 8, paddingBottom: 6, borderBottom: `1px solid ${S.borderL}`, display: "flex", alignItems: "center", gap: 6 }}><Users size={14} /> Team — who's working this call</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 18 }}>
+            <FW label="Lead (in charge)" hint={`Defaults to you — ${user?.name || "current user"}`}><SearchSelect value={form.leadName} options={STAFF.map(s => s.name)} placeholder={user?.name || "Select..."} width="100%" onChange={v => updateForm("leadName", v)} /></FW>
+            <FW label="Support team" hint="Everyone added sees this op under My operations"><MultiSearchSelect value={form.supportNames} options={STAFF.map(s => s.name)} placeholder="Add colleagues..." width="100%" onChange={v => updateForm("supportNames", v)} /></FW>
+          </div>
+
           {/* ── Voyage Section ── */}
           <div style={{ fontSize: 12, fontWeight: 500, color: S.textS, marginBottom: 8, paddingBottom: 6, borderBottom: `1px solid ${S.borderL}`, display: "flex", alignItems: "center", gap: 6 }}><MapPin size={14} /> Voyage details</div>
 
@@ -4613,7 +4708,8 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
       })}
     </div>
     <FilterBar filters={all} active={filter} onToggle={toggle} count={filtered.length} />
-    <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: -34, position: "relative", zIndex: 2, paddingRight: 210 }}>
+    <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginBottom: -34, position: "relative", zIndex: 2, paddingRight: 210 }}>
+      <button onClick={() => setMineOnly(!mineOnly)} title="Show only operations where you're on the team" style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 12px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: "pointer", border: `1px solid ${mineOnly ? S.brand : S.border}`, background: mineOnly ? S.brand : "transparent", color: mineOnly ? "#fff" : S.text, marginTop: 6 }}><UserCircle size={12} /> My operations ({myOpsCount})</button>
       <button onClick={() => setEmailImport(!emailImport)} style={{ display: "flex", alignItems: "center", gap: 4, padding: "5px 12px", borderRadius: 4, fontSize: 11, fontWeight: 500, cursor: "pointer", border: `1px solid ${S.brand}`, background: emailImport ? S.brand : "transparent", color: emailImport ? "#fff" : S.brand, marginTop: 6 }}><MessageCircle size={12} /> Create from email</button>
     </div>
     <Toolbar title="Operations — list report (Section 3)" onCreate={() => setShowCreate(true)} />
@@ -4631,7 +4727,7 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
     <div style={{ background: S.surface, border: `1px solid ${S.border}`, borderRadius: "0 0 8px 8px", overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
         <thead><tr style={{ background: "#F2F2F2" }}>
-          {["Op number", "Status", "Vessel", "Client", "Flag", "GT", "Ports", "ETA", "Ccy", "Svcs", "PDAs", "FDAs", "In charge"].map((h, i) => (
+          {["Op number", "Status", "Vessel", "Client", "Flag", "GT", "Ports", "ETA", "Ccy", "Svcs", "PDAs", "FDAs", "Team"].map((h, i) => (
             <th key={i} style={{ textAlign: "left", padding: "9px 12px", color: S.textS, fontWeight: 500, fontSize: 11, borderBottom: `1px solid ${S.border}`, whiteSpace: "nowrap" }}>{h}</th>
           ))}
         </tr></thead>
@@ -4652,7 +4748,7 @@ const OperationsView = ({ activeEntity, intent, clearIntent, user, owners, allOp
               <td style={{ padding: "9px 12px", borderBottom: `1px solid ${S.borderL}` }}>{op.serviceCount}</td>
               <td style={{ padding: "9px 12px", borderBottom: `1px solid ${S.borderL}` }}>{op.pdaCount}</td>
               <td style={{ padding: "9px 12px", borderBottom: `1px solid ${S.borderL}` }}>{op.fdaCount}</td>
-              <td style={{ padding: "9px 12px", borderBottom: `1px solid ${S.borderL}` }}>{STAFF.find(s => s.id === op.staffId)?.name || "—"}</td>
+              <td style={{ padding: "9px 12px", borderBottom: `1px solid ${S.borderL}` }}>{(() => { const t = teamMembers(op); if (!t.length) return "—"; const lead = t.find(m => m.role === "Lead") || t[0]; const others = t.filter(m => m !== lead); return <span title={t.map(m => `${m.name} (${m.role})`).join(", ")}>{lead.name.split(" ")[0]}{others.length > 0 && <span style={{ marginLeft: 4, padding: "1px 6px", borderRadius: 8, fontSize: 10, background: S.brandL, color: S.brand, fontWeight: 600 }}>+{others.length}</span>}{onTeam(op, user?.id) && <span style={{ marginLeft: 4, fontSize: 9.5, color: S.green, fontWeight: 600 }}>YOU</span>}</span>; })()}</td>
             </tr>
           ))}
         </tbody>
@@ -7921,7 +8017,7 @@ function FelixIQ({ currentUser, onSignOut }) {
 
   const render = () => {
     switch (mod) {
-      case "dashboard": return <DashboardView setMod={setMod} onCreateOp={goCreateOp} allOps={allOps} />;
+      case "dashboard": return <DashboardView setMod={setMod} onCreateOp={goCreateOp} allOps={allOps} user={user} openMyOps={() => { setOpIntent({ mineOnly: true }); setMod("operations"); }} />;
       case "operations": return <OperationsView activeEntity={entity} intent={opIntent} clearIntent={() => setOpIntent(null)} user={user} owners={allOwners} allOps={allOps} addOp={addOp} updOp={updOp} allYachts={allYachts} addYacht={addYacht} updYacht={updYacht} />;
       case "movements": return <MovementsView allYachts={allYachts} allOps={allOps} />;
       case "yachts": return <YachtsView allYachts={allYachts} allOwners={allOwners} allCompanies={allCompanies} allOps={allOps} addYacht={addYacht} addCompany={addCompany} importYachts={importYachts} updYacht={updYacht} nav={navToOp} intent={yachtIntent} clearIntent={() => setYachtIntent(null)} allTags={allTags} openCompany={openCompany} openOwner={openOwner} goBack={goBack} navDepth={navDepth} backLabel={backLabel} onCreateOp={goCreateOp} />;
@@ -7937,7 +8033,7 @@ function FelixIQ({ currentUser, onSignOut }) {
       case "finance": return <FinanceView activeEntity={entity} allOps={allOps} />;
       case "tariffs": return <TariffView />;
       case "access": return <AccessView />;
-      default: return <DashboardView setMod={setMod} onCreateOp={goCreateOp} allOps={allOps} />;
+      default: return <DashboardView setMod={setMod} onCreateOp={goCreateOp} allOps={allOps} user={user} openMyOps={() => { setOpIntent({ mineOnly: true }); setMod("operations"); }} />;
     }
   };
 
